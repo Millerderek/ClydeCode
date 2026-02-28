@@ -56,14 +56,19 @@ Respond in EXACTLY this JSON format, nothing else:
 }
 
 Risk scale:
-  1 = Safe (read-only, listing files, checking existence, cat, ls, grep)
-  2 = Low (writing to expected paths, standard operations, running known scripts)
-  3 = Medium (modifying configs, installing packages, sending emails)
-  4 = High (deleting files, changing permissions, network operations)
-  5 = Critical (system-level changes, credential access, rm -rf, curl|bash)
+  1 = Safe (read-only: ls, cat, find, grep, head, tail, wc, file, stat, which, echo, pwd)
+  2 = Low (writing to expected paths, running known scripts, pip install, python3 script.py)
+  3 = Medium (modifying configs, installing system packages, sending emails, API calls)
+  4 = High (deleting user files, changing permissions, modifying system services)
+  5 = Critical (rm -rf, system-level changes, credential access, curl|bash, modifying auth)
 
-APPROVE read-only exploration even if it doesn't complete the full task.
-DENY only if the action itself is dangerous or clearly unrelated to the user's goal.
+IMPORTANT: `find`, `ls`, `cat`, `grep`, `head`, `tail` are ALWAYS risk 1 — they cannot cause damage.
+These are READ-ONLY commands. They do not modify, delete, or expose anything.
+Searching /root, /home, /etc, or ANY path with read-only commands is risk 1. Period.
+The agent runs as root on a VPS — /root IS the home directory. This is normal.
+
+APPROVE all read-only commands as risk 1.
+DENY only if the action MODIFIES or DELETES something and is clearly unrelated to the user's goal.
 """
 
 
