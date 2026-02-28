@@ -1357,6 +1357,7 @@ class PermissionGate:
         self.task_approved = {}     # user_id -> task_id (approved for current task)
         self._current_task = {}     # user_id -> task_id (active task being processed)
         self._current_task_message = {}  # user_id -> original user message text
+        self._task_notified = {}    # user_id -> bool (has agent been notified of approval)
         self._perm_bot = None       # The permission bot instance (telegram.Bot)
         self._perm_app = None       # The permission bot Application (for polling)
         self._perm_token = perm_token
@@ -1639,6 +1640,7 @@ class PermissionGate:
         self._current_task_message[user_id] = message_text
         # Clear previous task approval — new message = new approval
         self.task_approved.pop(user_id, None)
+        self._task_notified.pop(user_id, None)
         return task_id
 
     def add_session_approval(self, user_id, tool_name, tool_input):
@@ -1807,6 +1809,21 @@ class SessionManager:
         oc = load_openclaw_memory(self.config)
         if oc: sys_parts.append(oc)
         if self.config.system_prompt: sys_parts.append(self.config.system_prompt)
+
+        # Tell the agent how the permission system works
+        if self.config.require_permission:
+            sys_parts.append(
+                "## Tool Permission System\n"
+                "Your tool calls go through an automated audit chain. Here's how it works:\n"
+                "- Low-risk tools (reads, file writes, searches) are auto-approved. Do NOT hesitate or explain each one.\n"
+                "- The first tool call in a task triggers a one-time review. Once approved, ALL subsequent tools for this task execute without stopping.\n"
+                "- High-risk tools (deleting files, system commands, secrets) may be escalated to the user.\n"
+                "- If a tool is denied, you'll get a denial message. Otherwise assume approval and keep going.\n\n"
+                "IMPORTANT: Do NOT pre-explain every tool call. Do NOT batch defensively. Do NOT say 'waiting for approval'.\n"
+                "Plan your approach, then execute. The permission system handles safety — you handle the task.\n"
+                "If you need to write 20 files, write 20 files. Don't stop between each one to narrate."
+            )
+
         if sys_parts: opts["system_prompt"] = "\n\n".join(sys_parts)
         if self.config.use_project_settings: opts["setting_sources"] = ["project"]
 
@@ -1871,6 +1888,17 @@ class SessionManager:
                                 # Silent auto-approve
                                 logger.info("🟢 Auto-approved (risk %d≤%d): %s for user %d",
                                            risk, auto_max, tool_name, uid)
+                                # Notify agent of approval status on first tool of task
+                                if gate.task_approved.get(uid) == task_id and not gate._task_notified.get(uid):
+                                    gate._task_notified[uid] = True
+                                    if gate._main_bot:
+                                        try:
+                                            await gate._main_bot.send_message(
+                                                chat_id=uid,
+                                                text="✅ Task approved — executing",
+                                            )
+                                        except:
+                                            pass
                                 return {}
                             else:
                                 # Auto-approve with notification
@@ -1907,8 +1935,25 @@ class SessionManager:
                 approved = await gate.request_task_permission(uid, task_id, task_msg, tool_name, tool_input)
 
                 if approved:
+                    # Notify agent that human approved
+                    if gate._main_bot:
+                        try:
+                            await gate._main_bot.send_message(
+                                chat_id=uid,
+                                text="✅ Task approved by user — executing",
+                            )
+                        except:
+                            pass
                     return {}  # Allow
                 else:
+                    if gate._main_bot:
+                        try:
+                            await gate._main_bot.send_message(
+                                chat_id=uid,
+                                text="❌ Task denied by user",
+                            )
+                        except:
+                            pass
                     return {
                         "hookSpecificOutput": {
                             "hookEventName": "PreToolUse",
