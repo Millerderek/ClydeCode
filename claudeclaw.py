@@ -521,7 +521,8 @@ def build_default_audit_chain() -> AuditChain:
     chain = AuditChain(consensus_mode="single")
 
     # Try loading from config file
-    config_path = Path(os.environ.get("CLAUDECLAW_AUDITORS", ""))
+    env_path = os.environ.get("CLAUDECLAW_AUDITORS", "")
+    config_path = Path(env_path) if env_path else Path("/dev/null/nonexistent")
     if not config_path.exists():
         config_path = Path.home() / ".claudeclaw" / "auditors.json"
 
