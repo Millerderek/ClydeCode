@@ -21,15 +21,29 @@ Each user gets a **persistent `ClaudeSDKClient` session** — Claude remembers t
                     └──────────────────┘
 ```
 
-## Why?
+---
 
-If you already live inside Claude Code, you're duplicating effort by building:
-- A skills engine → **Claude Code already has one**
-- A memory system → **CLAUDE.md already does this**
-- Integrations → **MCP servers already handle this**
-- Orchestration → **The Agent SDK loop already does this**
+## Before You Install
 
-ClaudeClaw just bridges mobile access to that environment. Improvements apply everywhere.
+Have these ready — the installer will prompt for each:
+
+| # | What | Where to Get It | Time |
+|---|------|-----------------|------|
+| 1 | **Main bot token** | [@BotFather](https://t.me/BotFather) → `/newbot` → name it anything (e.g. "MyClaw") | 1 min |
+| 2 | **Permission bot token** | [@BotFather](https://t.me/BotFather) → `/newbot` → name it anything (e.g. "MyClawPerms") | 1 min |
+| 3 | **Your Telegram user ID** | Message [@userinfobot](https://t.me/userinfobot) → it replies with your numeric ID | 30 sec |
+| 4 | **Claude Code login** | `npm install -g @anthropic-ai/claude-code && claude` → authenticate via browser | 2 min |
+| 5 | **Auditor API key(s)** | [OpenAI](https://platform.openai.com/api-keys), [Google AI](https://aistudio.google.com/apikey), [Groq](https://console.groq.com/keys), etc. | 2 min |
+
+### Creating Telegram Bots
+
+1. Open Telegram and message **@BotFather**
+2. Send `/newbot`
+3. Pick a display name (e.g. "MyClaw Bot")
+4. Pick a username ending in `bot` (e.g. `myclaw_bot`)
+5. Copy the token — it looks like `7948123456:AAH...`
+6. **Repeat for the permission bot** — this is a second bot that only handles Approve/Deny buttons, keeping your main conversation clean
+7. **Message `/start` to both bots** from your Telegram account so they can send you messages
 
 ---
 
@@ -41,10 +55,10 @@ ClaudeClaw just bridges mobile access to that environment. Improvements apply ev
 curl -fsSL https://raw.githubusercontent.com/Millerderek/ClydeCode/main/install.sh | bash
 ```
 
-The interactive wizard walks you through everything:
+The interactive wizard walks you through:
 1. System dependencies (Python, Node.js, git, screen)
 2. Claude Code OAuth login
-3. Telegram bot creation (main + permission bot)
+3. Telegram bot tokens (main + permission)
 4. User authentication (Telegram user IDs)
 5. Audit chain setup (pick AI reviewers from presets)
 6. ClawVault encrypted key storage
@@ -58,7 +72,7 @@ git clone https://github.com/Millerderek/ClydeCode.git ~/claudeclaw
 cd ~/claudeclaw
 pip install -r requirements.txt
 cp .env.example .env
-# Edit .env: set TELEGRAM_BOT_TOKEN and ALLOWED_USER_IDS
+# Edit .env: set TELEGRAM_BOT_TOKEN, PERMISSION_BOT_TOKEN, and ALLOWED_USER_IDS
 python3 claudeclaw.py
 ```
 
@@ -66,7 +80,7 @@ python3 claudeclaw.py
 
 #### First Time: Passwordless SSH
 
-Run these once — after this, every command is password-free:
+Run once — after this, every command is password-free:
 
 ```powershell
 # 1. Generate SSH key (skip if you already have one)
@@ -87,6 +101,8 @@ ssh root@YOUR_VPS_IP "curl -fsSL https://raw.githubusercontent.com/Millerderek/C
 The wizard runs interactively over SSH. Done.
 
 #### Deploy Updates (from PowerShell, no password)
+
+The installer auto-generates `deploy.sh` on the VPS. Use it for updates:
 
 ```powershell
 # One-liner: upload new code and restart
@@ -111,17 +127,15 @@ ssh root@YOUR_VPS_IP "tail -f /tmp/claw.log"
 
 ---
 
-## Before You Install
+## Why?
 
-You'll need these ready (the installer will prompt for each):
+If you already live inside Claude Code, you're duplicating effort by building:
+- A skills engine → **Claude Code already has one**
+- A memory system → **CLAUDE.md already does this**
+- Integrations → **MCP servers already handle this**
+- Orchestration → **The Agent SDK loop already does this**
 
-| What | Where to Get It |
-|------|----------------|
-| Telegram main bot token | [@BotFather](https://t.me/BotFather) → `/newbot` |
-| Telegram permission bot token | [@BotFather](https://t.me/BotFather) → `/newbot` (second bot) |
-| Your Telegram user ID | [@userinfobot](https://t.me/userinfobot) |
-| Claude Code login | `npm install -g @anthropic-ai/claude-code && claude` |
-| Auditor API key(s) | [OpenAI](https://platform.openai.com/api-keys), [Google AI](https://aistudio.google.com/apikey), etc. |
+ClaudeClaw just bridges mobile access to that environment. Improvements apply everywhere.
 
 ---
 
@@ -141,9 +155,9 @@ All config via environment variables (or `.env` file). The installer generates t
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `TELEGRAM_BOT_TOKEN` | ✅ | — | Main bot token from @BotFather |
+| `PERMISSION_BOT_TOKEN` | ✅ | — | Permission bot token from @BotFather |
 | `ALLOWED_USER_IDS` | ✅ | — | Comma-separated Telegram user IDs |
 | `ANTHROPIC_API_KEY` | — | — | Fallback if no OAuth session |
-| `PERMISSION_BOT_TOKEN` | — | — | Permission bot token |
 | `CLAUDECLAW_WORKING_DIR` | — | `~` | Workspace path |
 | `CLAUDECLAW_MODEL` | — | SDK default | Model override |
 | `CLAUDECLAW_PERMISSION_MODE` | — | `default` | `default` or `acceptEdits` |
@@ -181,6 +195,17 @@ All config via environment variables (or `.env` file). The installer generates t
 ---
 
 ## Security
+
+### Dual-Bot Permission System
+
+ClaudeClaw uses **two separate Telegram bots** to keep approval prompts out of your main conversation:
+
+| Bot | What It Does |
+|-----|-------------|
+| **Main bot** | Your conversation with Claude — messages, responses, file uploads |
+| **Permission bot** | Sends approval requests with ✅ Approve / ❌ Deny buttons |
+
+When you send a message that triggers tools, the permission bot sends one approval request. Tap once, and all tools for that task auto-approve. Your next message triggers a fresh approval.
 
 ### Audit Chain
 
@@ -264,24 +289,17 @@ Custom providers auto-try `<PROVIDER_UPPER>_API_KEY` (e.g., `DEEPSEEK_API_KEY`).
 /approve nginx bash_prefix systemctl restart nginx 4
 ```
 
-Format: `/approve <name> <type> <pattern> [max_risk]`
+Format: `/approve <n> <type> <pattern> [max_risk]`
 
 Types: `bash_prefix`, `bash_exact`, `bash_contains`, `tool`, `skill`
 
 Standing approvals persist in `~/.claudeclaw/standing_approvals.json`.
 
-### Dual-Bot Permission System
-
-| Bot | Role |
-|-----|------|
-| **Main bot** | Your conversation with Claude |
-| **Permission bot** | Task approval requests with Approve/Deny buttons |
-
 ### Other Protections
 
 - User allowlist via `ALLOWED_USER_IDS`
 - Workspace scoping via `CLAUDECLAW_WORKING_DIR`
-- Telegram is NOT e2e encrypted — don't send secrets
+- Telegram is NOT e2e encrypted — don't send secrets through the bot
 
 ---
 
