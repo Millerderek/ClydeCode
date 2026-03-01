@@ -1138,6 +1138,291 @@ VAULT_KEY_CATALOG = {
 }
 
 
+# ─── Shopping Comparison ──────────────────────────────────────────────────────
+
+@dataclass
+class ProductResult:
+    """A single product from shopping search results."""
+    rank: int = 0
+    name: str = ""
+    rating: float = 0.0
+    review_count: int = 0
+    price: float = 0.0
+    price_str: str = ""
+    source: str = ""          # store name (e.g., "Nike.com", "Amazon")
+    link: str = ""            # purchase URL
+    image_url: str = ""       # thumbnail URL for send_photo
+    delivery: str = ""        # delivery info string
+
+
+class ShoppingSearch:
+    """Search for products using Serper.dev Google Shopping or Gemini Grounding fallback."""
+
+    SERPER_ENDPOINT = "https://google.serper.dev/shopping"
+    GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+
+    def __init__(self):
+        self._http = None
+
+    async def _get_http(self):
+        if self._http is None or self._http.closed:
+            self._http = aiohttp.ClientSession()
+        return self._http
+
+    async def close(self):
+        if self._http and not self._http.closed:
+            await self._http.close()
+
+    def _resolve_keys(self):
+        """Resolve API keys from ClawVault then env vars."""
+        vault_data = load_vault()
+        serper_key = vault_data.get("SERPER_API_KEY", "") or os.environ.get("SERPER_API_KEY", "")
+        gemini_key = (vault_data.get("GEMINI_API_KEY", "") or vault_data.get("GOOGLE_API_KEY", "")
+                      or os.environ.get("GEMINI_API_KEY", "") or os.environ.get("GOOGLE_API_KEY", ""))
+        return serper_key, gemini_key
+
+    @staticmethod
+    def parse_query(text):
+        """Extract search terms, price range, and count from natural language.
+
+        Returns: (query_str, min_price, max_price, count)
+
+        Examples:
+          "find me 5 of the top running shoes between 150-200 dollars"
+          -> ("running shoes", 150.0, 200.0, 5)
+          "compare 3 wireless headphones under $100"
+          -> ("wireless headphones", 0.0, 100.0, 3)
+        """
+        count = 5
+        min_price = 0.0
+        max_price = 0.0
+
+        # Extract count: "5 of the top", "compare 3", "top 10"
+        count_match = re.search(r'\b(\d{1,2})\b\s+(?:of\s+the\s+(?:top|best)|(?:top|best))', text, re.I)
+        if not count_match:
+            count_match = re.search(r'(?:compare|find|show|get)\s+(?:me\s+)?(\d{1,2})\b', text, re.I)
+        if not count_match:
+            count_match = re.search(r'(?:top|best)\s+(\d{1,2})\b', text, re.I)
+        if count_match:
+            count = min(int(count_match.group(1)), 20)
+
+        # Extract price range: "between 150-200", "$150-$200", "150 to 200 dollars"
+        price_range = re.search(
+            r'(?:between\s+)?\$?(\d+(?:\.\d{2})?)\s*[-\u2013to]+\s*\$?(\d+(?:\.\d{2})?)\s*(?:dollars?|bucks?|\$)?',
+            text, re.I
+        )
+        if price_range:
+            min_price = float(price_range.group(1))
+            max_price = float(price_range.group(2))
+        else:
+            under_match = re.search(r'(?:under|below|less\s+than|max)\s+\$?(\d+(?:\.\d{2})?)', text, re.I)
+            if under_match:
+                max_price = float(under_match.group(1))
+            over_match = re.search(r'(?:over|above|more\s+than|at\s+least|min(?:imum)?)\s+\$?(\d+(?:\.\d{2})?)', text, re.I)
+            if over_match:
+                min_price = float(over_match.group(1))
+
+        # Strip out count/price/filler phrases to isolate product type
+        query = text
+        removals = [
+            r'\b\d{1,2}\s+of\s+the\s+(?:top|best)\b',
+            r'(?:compare|find|show|get|search|look\s+for)\s+(?:me\s+)?(?:\d{1,2}\s+)?',
+            r'(?:top|best)\s+\d{1,2}\b',
+            r'(?:between\s+)?\$?\d+(?:\.\d{2})?\s*[-\u2013to]+\s*\$?\d+(?:\.\d{2})?\s*(?:dollars?|bucks?|\$)?',
+            r'(?:under|below|less\s+than|max|over|above|more\s+than|at\s+least|min(?:imum)?)\s+\$?\d+(?:\.\d{2})?',
+            r'\b(?:dollars?|bucks?|to\s+compare)\b',
+            r'\b(?:of\s+the|the\s+top|the\s+best)\b',
+        ]
+        for pattern in removals:
+            query = re.sub(pattern, ' ', query, flags=re.I)
+        query = re.sub(r'\s+', ' ', query).strip(' .,!?')
+        if not query:
+            query = text
+
+        return query, min_price, max_price, count
+
+    async def search(self, raw_query, min_price=0, max_price=0, count=5):
+        """Search for products. Returns list[ProductResult].
+
+        Tries Serper first (structured JSON with images), falls back to Gemini.
+        """
+        serper_key, gemini_key = self._resolve_keys()
+
+        if serper_key:
+            try:
+                results = await self._search_serper(serper_key, raw_query, min_price, max_price, count)
+                if results:
+                    return results
+                logger.warning("Serper returned no results, trying Gemini fallback")
+            except Exception as e:
+                logger.error("Serper search failed: %s", e)
+
+        if gemini_key:
+            try:
+                return await self._search_gemini(gemini_key, raw_query, min_price, max_price, count)
+            except Exception as e:
+                logger.error("Gemini shopping search failed: %s", e)
+
+        return []
+
+    async def _search_serper(self, api_key, query, min_price, max_price, count):
+        """Serper.dev Google Shopping API. Returns list[ProductResult]."""
+        http = await self._get_http()
+
+        search_q = query
+        if min_price and max_price:
+            search_q += " $%g-$%g" % (min_price, max_price)
+        elif max_price:
+            search_q += " under $%g" % max_price
+        elif min_price:
+            search_q += " over $%g" % min_price
+
+        payload = {"q": search_q, "num": min(count * 3, 40)}
+        headers = {"X-API-KEY": api_key, "Content-Type": "application/json"}
+
+        async with http.post(
+            self.SERPER_ENDPOINT, json=payload, headers=headers,
+            timeout=aiohttp.ClientTimeout(total=15)
+        ) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                logger.error("Serper HTTP %d: %s", resp.status, body[:300])
+                return []
+            data = await resp.json()
+
+        results = []
+        items = data.get("shopping", [])
+
+        for item in items:
+            price_str = item.get("price", "")
+            price_val = 0.0
+            price_match = re.search(r'[\$]?([\d,]+(?:\.\d{2})?)', str(price_str))
+            if price_match:
+                price_val = float(price_match.group(1).replace(",", ""))
+
+            if min_price and price_val < min_price:
+                continue
+            if max_price and price_val > max_price:
+                continue
+
+            results.append(ProductResult(
+                rank=len(results) + 1,
+                name=item.get("title", "Unknown Product"),
+                rating=float(item.get("rating", 0) or 0),
+                review_count=int(item.get("ratingCount", 0) or 0),
+                price=price_val,
+                price_str=price_str if price_str else ("$%.2f" % price_val if price_val else "Price N/A"),
+                source=item.get("source", "Unknown"),
+                link=item.get("link", ""),
+                image_url=item.get("imageUrl", ""),
+                delivery=item.get("delivery", ""),
+            ))
+            if len(results) >= count * 2:
+                break
+
+        # Sort by rating desc, then review count desc
+        results.sort(key=lambda r: (r.rating, r.review_count), reverse=True)
+        results = results[:count]
+        for i, r in enumerate(results):
+            r.rank = i + 1
+
+        return results
+
+    async def _search_gemini(self, api_key, query, min_price, max_price, count):
+        """Gemini Grounding fallback. Returns list[ProductResult] (no images)."""
+        http = await self._get_http()
+
+        price_clause = ""
+        if min_price and max_price:
+            price_clause = " priced between $%g and $%g" % (min_price, max_price)
+        elif max_price:
+            price_clause = " priced under $%g" % max_price
+        elif min_price:
+            price_clause = " priced over $%g" % min_price
+
+        prompt = (
+            "Find the top %d %s%s available for purchase online right now. "
+            "Rank by customer reviews and ratings. "
+            "For each product provide: product name, rating out of 5, approximate number of reviews, "
+            "exact current price, store name, and direct purchase URL. "
+            "Respond with ONLY a JSON array, no markdown fences, no explanation. "
+            'Each object: {"name": str, "rating": float, "reviews": int, '
+            '"price": str, "price_num": float, "store": str, "url": str}'
+        ) % (count, query, price_clause)
+
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "tools": [{"google_search_retrieval": {}}],
+            "generationConfig": {
+                "temperature": 0.1,
+                "maxOutputTokens": 4000,
+            },
+        }
+
+        url = "%s?key=%s" % (self.GEMINI_ENDPOINT, api_key)
+        async with http.post(
+            url, json=payload, headers={"Content-Type": "application/json"},
+            timeout=aiohttp.ClientTimeout(total=30)
+        ) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                logger.error("Gemini shopping HTTP %d: %s", resp.status, body[:300])
+                return []
+            data = await resp.json()
+
+        # Extract text from Gemini response
+        try:
+            candidates = data.get("candidates", [])
+            if not candidates:
+                return []
+            parts = candidates[0]["content"]["parts"]
+            all_text = []
+            for part in parts:
+                if "text" in part:
+                    all_text.append(part["text"])
+            raw_text = "\n".join(all_text).strip()
+        except (KeyError, IndexError) as e:
+            logger.error("Gemini response parse error: %s", e)
+            return []
+
+        # Parse JSON from response
+        clean = re.sub(r"```(?:json)?\s*", "", raw_text)
+        clean = re.sub(r"\s*```", "", clean).strip()
+
+        try:
+            items = json.loads(clean)
+        except json.JSONDecodeError:
+            arr_match = re.search(r'\[.*\]', clean, re.DOTALL)
+            if arr_match:
+                try:
+                    items = json.loads(arr_match.group())
+                except json.JSONDecodeError:
+                    logger.error("Could not parse Gemini shopping JSON: %s", clean[:500])
+                    return []
+            else:
+                logger.error("No JSON array in Gemini shopping response: %s", clean[:500])
+                return []
+
+        if not isinstance(items, list):
+            return []
+
+        results = []
+        for i, item in enumerate(items[:count]):
+            results.append(ProductResult(
+                rank=i + 1,
+                name=item.get("name", "Unknown"),
+                rating=float(item.get("rating", 0) or 0),
+                review_count=int(item.get("reviews", 0) or 0),
+                price=float(item.get("price_num", 0) or 0),
+                price_str=item.get("price", ""),
+                source=item.get("store", ""),
+                link=item.get("url", ""),
+                image_url="",  # Gemini does NOT return images
+                delivery="",
+            ))
+        return results
+
+
 def load_vault() -> dict:
     """Load and decrypt ClawVault. Returns dict of key_name → value."""
     try:
@@ -3101,6 +3386,164 @@ async def cmd_vault(update, context):
             parse_mode=ParseMode.MARKDOWN)
 
 
+# ─── Shopping Command ──────────────────────────────────────────────────────
+
+def _escape_md(text):
+    """Escape Telegram Markdown v1 special characters in external text."""
+    if not text:
+        return ""
+    for ch in ('*', '_', '`', '[', ']'):
+        text = text.replace(ch, '\\' + ch)
+    return text
+
+
+def _format_number(n):
+    """Format number with commas: 2341 -> '2,341'."""
+    return "{:,}".format(int(n))
+
+
+def _format_product_card(product):
+    """Format a ProductResult as a Telegram photo caption (max 1024 chars)."""
+    lines = []
+
+    # Rank and name
+    lines.append("*#%d  %s*" % (product.rank, _escape_md(product.name[:80])))
+
+    # Rating
+    if product.rating > 0:
+        stars = "%.1f/5" % product.rating
+        if product.review_count:
+            stars += " (%s reviews)" % _format_number(product.review_count)
+        lines.append("Rating: %s" % stars)
+
+    # Price and source
+    if product.price_str:
+        price_line = "*%s*" % _escape_md(product.price_str)
+        if product.source:
+            price_line += " — %s" % _escape_md(product.source)
+        lines.append(price_line)
+
+    # Delivery info
+    if product.delivery:
+        lines.append("%s" % _escape_md(product.delivery[:60]))
+
+    # Purchase link
+    if product.link:
+        link_label = product.source or "Store"
+        lines.append("[View / Buy at %s](%s)" % (_escape_md(link_label), product.link))
+
+    caption = "\n".join(lines)
+    if len(caption) > 1020:
+        caption = caption[:1017] + "..."
+    return caption
+
+
+async def cmd_shop(update, context):
+    """Shopping comparison: /shop <natural language query>"""
+    config = context.bot_data["config"]
+    uid = update.effective_user.id
+    if not is_authorized(config, uid):
+        return
+
+    raw_text = " ".join(context.args) if context.args else ""
+    if not raw_text:
+        await update.message.reply_text(
+            "*Shopping Comparison*\n\n"
+            "Usage: `/shop <what you want to find>`\n\n"
+            "Examples:\n"
+            "  `/shop find me 5 running shoes between 150-200 dollars`\n"
+            "  `/shop compare 3 wireless headphones under $100`\n"
+            "  `/shop best gaming laptops`\n\n"
+            "I'll search, rank by reviews, and show photos & prices for each product.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    # Parse the natural language query
+    query, min_price, max_price, count = ShoppingSearch.parse_query(raw_text)
+
+    price_desc = ""
+    if min_price and max_price:
+        price_desc = " ($%g – $%g)" % (min_price, max_price)
+    elif max_price:
+        price_desc = " (under $%g)" % max_price
+    elif min_price:
+        price_desc = " (over $%g)" % min_price
+
+    status_msg = await update.message.reply_text(
+        "Searching for top %d *%s*%s ...\nThis may take a moment." % (count, _escape_md(query), price_desc),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+    typing_task = asyncio.create_task(keep_typing(update))
+
+    searcher = ShoppingSearch()
+    try:
+        results = await searcher.search(query, min_price, max_price, count)
+    except Exception as e:
+        logger.error("Shopping search error: %s", e, exc_info=True)
+        typing_task.cancel()
+        await update.message.reply_text("Search failed: %s" % e)
+        return
+    finally:
+        await searcher.close()
+        typing_task.cancel()
+        try:
+            await typing_task
+        except asyncio.CancelledError:
+            pass
+
+    if not results:
+        serper_key, gemini_key = ShoppingSearch()._resolve_keys()
+        if not serper_key and not gemini_key:
+            await update.message.reply_text(
+                "No search API keys configured.\n\n"
+                "Add one to enable shopping:\n"
+                "  `/vault set SERPER_API_KEY <key>` _(recommended — free at serper.dev)_\n"
+                "  `/vault set GEMINI_API_KEY <key>` _(fallback, text-only results)_",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            await update.message.reply_text(
+                "No products found for: *%s*%s\nTry different search terms or a wider price range." % (
+                    _escape_md(query), price_desc),
+                parse_mode=ParseMode.MARKDOWN
+            )
+        return
+
+    # Update status
+    source_label = "Google Shopping" if results[0].image_url else "Gemini Search"
+    try:
+        await status_msg.edit_text(
+            "Found *%d* products for *%s*%s\n_(via %s — ranked by reviews)_" % (
+                len(results), _escape_md(query), price_desc, source_label),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    except Exception:
+        pass
+
+    # Send each product as a photo card
+    for product in results:
+        caption = _format_product_card(product)
+
+        if product.image_url:
+            try:
+                await update.message.reply_photo(
+                    photo=product.image_url,
+                    caption=caption,
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception as e:
+                logger.warning("send_photo failed for '%s': %s — falling back to text", product.name[:30], e)
+                await update.message.reply_text(caption, parse_mode=ParseMode.MARKDOWN)
+        else:
+            await update.message.reply_text(caption, parse_mode=ParseMode.MARKDOWN)
+
+        await asyncio.sleep(0.3)
+
+    logger.info("Shopping: sent %d results for '%s' to user %d", len(results), query[:50], uid)
+
+
 # ─── Telegram Message Handlers ─────────────────────────────────────────────
 
 async def handle_message(update, context):
@@ -3222,6 +3665,7 @@ async def post_init(app):
         BotCommand("workspace", "List files"),
         BotCommand("whoami", "Your Telegram ID"),
         BotCommand("update", "Install available update"),
+        BotCommand("shop", "Compare products with prices & photos"),
     ])
     # Start two-tier update checker
     config = app.bot_data.get("config")
@@ -3371,6 +3815,7 @@ def main():
     app.add_handler(CommandHandler("removeauditor", cmd_removeauditor))
     app.add_handler(CommandHandler("toggleauditor", cmd_toggleauditor))
     app.add_handler(CommandHandler("vault", cmd_vault))
+    app.add_handler(CommandHandler("shop", cmd_shop))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
