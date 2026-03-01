@@ -3,11 +3,13 @@
 ClydeCodeBot - Telegram to Claude Agent SDK Bridge
 Uses ClaudeSDKClient for persistent per-user conversation sessions.
 Includes OTP permission gate for tool approvals via Telegram.
+
+Last updated: 2026-02-28 18:55 EST
 """
 import os, sys, asyncio, logging, time, re, secrets, json, hashlib
 from pathlib import Path
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 import aiohttp
 from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
@@ -582,8 +584,14 @@ These are READ-ONLY commands. They do not modify, delete, or expose anything.
 Searching /root, /home, /etc, or ANY path with read-only commands is risk 1. Period.
 The agent runs as root on a VPS — /root IS the home directory. This is normal.
 
-APPROVE all read-only commands as risk 1.
-DENY only if the action MODIFIES or DELETES something and is clearly unrelated to the user's goal.
+Verdict rules (follow strictly):
+  Risk 1-2 → verdict MUST be "approve" (these are safe, expected actions)
+  Risk 3   → verdict "approve" unless concerns are serious and specific
+  Risk 4   → verdict "warn" (flag for human review)
+  Risk 5   → verdict "deny" (block dangerous actions)
+
+Use "warn" ONLY at risk 4. Do NOT use "warn" for risk 1-3 — use "approve" instead.
+DENY only if the action is clearly malicious, destructive, or unrelated to the user's goal.
 """
 
 
@@ -920,8 +928,8 @@ class AuditChain:
         ]
 
         for r in results:
-            lines.append("%s *%s*: %s" % (
-                verdict_emoji.get(r.verdict, "❓"), r.auditor_name, r.summary
+            lines.append("%s *%s* (Risk %d/5): %s" % (
+                verdict_emoji.get(r.verdict, "❓"), r.auditor_name, r.risk, r.summary
             ))
             if r.concerns:
                 for c in r.concerns[:3]:
@@ -1496,7 +1504,7 @@ class PermissionGate:
                     return True
         return False
 
-    async def request_task_permission(self, user_id, task_id, task_message, tool_name, tool_input):
+    async def request_task_permission(self, user_id, task_id, task_message, tool_name, tool_input, audit_results=None):
         """Send task-level permission request via the permission bot.
         
         Flow: Claude proposes → AuditChain reviews → Permission bot shows
@@ -1531,7 +1539,16 @@ class PermissionGate:
         # ─── Audit Chain Review ────────────────────────────────────
         audit_section = ""
         auto_deny = False
-        if self._audit_chain and self._audit_chain.is_available:
+        if audit_results:
+            # Use pre-computed results from autonomous approval path
+            verdict, risk, results = audit_results
+            audit_section = "\n" + self._audit_chain.format_review_for_telegram(
+                results, verdict, risk
+            ) + "\n"
+            if verdict == "deny" and risk >= 5 and all(r.error == "" for r in results):
+                auto_deny = True
+                logger.warning("Audit chain auto-denied task for user %d (risk=%d)", user_id, risk)
+        elif self._audit_chain and self._audit_chain.is_available:
             try:
                 verdict, risk, results = await self._audit_chain.review(
                     task_message, tool_name, tool_input
@@ -1693,12 +1710,12 @@ class Config:
     audit_enabled: bool = True
     audit_consensus: str = "single"  # single, majority, unanimous
     # Global risk thresholds for autonomous mode
-    # ≤ auto_approve_max_risk + both agree → auto-execute silently
-    # ≤ alert_max_risk + both agree → auto-execute with alert notification
+    # ≤ auto_approve_max_risk + no deny → auto-execute silently
+    # ≤ alert_max_risk + no deny → auto-execute with alert notification
     # > alert_max_risk → always ask human
     auto_approve_max_risk: int = 2   # silent auto-approve
     alert_max_risk: int = 3          # auto-approve but send alert
-    # risk 4+ both agree → alert + wait for approval
+    # risk 4+ no deny → alert + wait for approval
     # risk 5 → always block
 
     @classmethod
@@ -1740,6 +1757,259 @@ class Config:
 
 def is_authorized(config, user_id):
     return user_id in config.allowed_user_ids
+
+
+# ─── Context Memory System ────────────────────────────────────────────────
+# Three-tier memory:
+#   Tier 1: MEMORY.md — Active state (always in prompt, agent-maintained)
+#   Tier 2: task_index.jsonl — Searchable task summaries (auto-indexed)
+#   Tier 3: chat_logs/ — Raw timestamped transcripts (auto-logged)
+#
+# On each message:
+#   1. Raw log written to chat_logs/YYYY-MM-DD.log
+#   2. Context retrieval: send user message + recent summaries to first
+#      available auditor, get top relevant matches, inject into prompt
+#
+# After each task:
+#   1. Send exchange to first available auditor for summarization
+#   2. Append summary to task_index.jsonl
+#   3. Agent updates MEMORY.md (via system prompt instruction)
+
+CONTEXT_DIR = CONFIG_DIR / "context"
+CHAT_LOG_DIR = CONTEXT_DIR / "chat_logs"
+TASK_INDEX_PATH = CONTEXT_DIR / "task_index.jsonl"
+MAX_CONTEXT_ENTRIES = 100      # Max entries to search
+MAX_INJECTED_CONTEXT = 3       # Top N matches to inject
+CONTEXT_MAX_AGE_DAYS = 90      # Prune entries older than this
+
+
+def ensure_context_dirs():
+    CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
+    CHAT_LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def log_chat(user_id: int, role: str, text: str):
+    """Append a raw message to today's chat log."""
+    ensure_context_dirs()
+    today = date.today().strftime("%Y-%m-%d")
+    logfile = CHAT_LOG_DIR / f"{today}.log"
+    ts = time.strftime("%H:%M:%S")
+    with open(logfile, "a", encoding="utf-8") as f:
+        # Truncate very long messages in log
+        logged = text[:5000] + ("..." if len(text) > 5000 else "")
+        f.write(f"[{ts}] {role} ({user_id}): {logged}\n")
+
+
+def load_task_index(limit: int = MAX_CONTEXT_ENTRIES) -> list[dict]:
+    """Load recent task summaries, newest first."""
+    if not TASK_INDEX_PATH.exists():
+        return []
+    entries = []
+    try:
+        with open(TASK_INDEX_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        entries.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+    except Exception:
+        return []
+    # Newest first
+    entries.sort(key=lambda e: e.get("ts", ""), reverse=True)
+    return entries[:limit]
+
+
+def append_task_index(entry: dict):
+    """Append a task summary to the index."""
+    ensure_context_dirs()
+    with open(TASK_INDEX_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+def prune_task_index():
+    """Remove entries older than MAX_CONTEXT_AGE_DAYS."""
+    if not TASK_INDEX_PATH.exists():
+        return
+    cutoff = (date.today() - timedelta(days=CONTEXT_MAX_AGE_DAYS)).isoformat()
+    entries = []
+    with open(TASK_INDEX_PATH, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+                if entry.get("ts", "") >= cutoff:
+                    entries.append(entry)
+            except json.JSONDecodeError:
+                continue
+    with open(TASK_INDEX_PATH, "w", encoding="utf-8") as f:
+        for entry in entries:
+            f.write(json.dumps(entry) + "\n")
+
+
+async def _call_first_auditor(audit_chain, prompt: str, max_tokens: int = 500) -> str | None:
+    """
+    Send a prompt to the first available auditor. Model-agnostic.
+    Returns the text response or None on failure.
+    """
+    if not audit_chain or not audit_chain.is_available:
+        return None
+
+    http = await audit_chain._get_http()
+
+    for auditor in audit_chain.active_auditors:
+        try:
+            if auditor.provider == "google":
+                url = f"{auditor.api_base.rstrip('/')}/v1beta/models/{auditor.model}:generateContent?key={auditor.api_key}"
+                payload = {
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {"temperature": 0.1, "maxOutputTokens": max_tokens}
+                }
+                async with http.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    data = await resp.json()
+                    parts = []
+                    for c in data.get("candidates", []):
+                        for p in c.get("content", {}).get("parts", []):
+                            parts.append(p.get("text", ""))
+                    result = "".join(parts).strip()
+                    if result:
+                        return result
+            else:
+                # OpenAI-compatible (openai, kimi, deepseek, groq, etc.)
+                url = f"{auditor.api_base.rstrip('/')}/v1/chat/completions"
+                payload = {
+                    "model": auditor.model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.1,
+                    "max_tokens": max_tokens,
+                }
+                headers = {"Authorization": f"Bearer {auditor.api_key}", "Content-Type": "application/json"}
+                async with http.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    data = await resp.json()
+                    result = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+                    if result:
+                        return result
+        except Exception as e:
+            logger.debug(f"Context retrieval auditor {auditor.name} failed: {e}")
+            continue
+
+    return None
+
+
+async def retrieve_context(audit_chain, user_message: str) -> str:
+    """
+    Search task index for relevant context using first available auditor.
+    Returns formatted context string to inject into the prompt.
+    """
+    entries = load_task_index()
+    if not entries:
+        return ""
+
+    # Build summary list for the retriever
+    summaries = []
+    for i, entry in enumerate(entries[:30]):  # Cap at 30 for prompt size
+        summaries.append(f"[{i}] ({entry.get('ts', '?')[:10]}) {entry.get('summary', '')}")
+
+    summaries_text = "\n".join(summaries)
+
+    retrieval_prompt = (
+        "You are a context retrieval system. Given the user's new message and a list of past task summaries, "
+        "return the indices of the 1-3 most relevant summaries that would help answer or continue the user's request.\n\n"
+        "USER MESSAGE:\n%s\n\n"
+        "PAST TASK SUMMARIES:\n%s\n\n"
+        "Respond with ONLY a JSON array of indices, e.g. [0, 3, 7]. "
+        "If nothing is relevant, respond with []."
+    ) % (user_message[:500], summaries_text)
+
+    result = await _call_first_auditor(audit_chain, retrieval_prompt, max_tokens=100)
+    if not result:
+        # Fallback: just return the 3 most recent entries
+        fallback = entries[:MAX_INJECTED_CONTEXT]
+        if not fallback:
+            return ""
+        parts = []
+        for e in fallback:
+            parts.append(f"({e.get('ts', '?')[:10]}) {e.get('summary', '')}")
+        return "<RECENT_CONTEXT>\n%s\n</RECENT_CONTEXT>" % "\n".join(parts)
+
+    # Parse indices
+    try:
+        clean = re.sub(r"```(?:json)?\s*", "", result)
+        clean = re.sub(r"\s*```", "", clean).strip()
+        indices = json.loads(clean)
+        if not isinstance(indices, list):
+            indices = []
+    except (json.JSONDecodeError, ValueError):
+        indices = []
+
+    if not indices:
+        return ""
+
+    # Build context from matched entries
+    matched = []
+    for idx in indices[:MAX_INJECTED_CONTEXT]:
+        if 0 <= idx < len(entries):
+            e = entries[idx]
+            matched.append(f"({e.get('ts', '?')[:10]}) {e.get('summary', '')}")
+            # Include status and details if present
+            if e.get("status"):
+                matched[-1] += f" [Status: {e['status']}]"
+            if e.get("details"):
+                matched.append(f"  Details: {e['details'][:300]}")
+
+    if not matched:
+        return ""
+
+    return "<RELEVANT_CONTEXT>\n%s\n</RELEVANT_CONTEXT>" % "\n".join(matched)
+
+
+async def summarize_task(audit_chain, user_message: str, assistant_response: str) -> dict | None:
+    """
+    After a task completes, ask the first available auditor to summarize it.
+    Returns a task index entry dict or None.
+    """
+    # Don't summarize very short interactions (greetings, simple questions)
+    if len(assistant_response) < 200 and len(user_message) < 100:
+        return None
+
+    summarize_prompt = (
+        "Summarize this task exchange in 1-2 sentences for future context retrieval. "
+        "Include: what was requested, what was done, key file paths or project names, and current status.\n\n"
+        "USER:\n%s\n\n"
+        "ASSISTANT:\n%s\n\n"
+        "Respond with ONLY JSON:\n"
+        '{"summary": "1-2 sentence summary", "status": "completed|pending|failed", '
+        '"project": "project name or null", "details": "key paths, configs, or decisions"}'
+    ) % (user_message[:1000], assistant_response[:3000])
+
+    result = await _call_first_auditor(audit_chain, summarize_prompt, max_tokens=300)
+    if not result:
+        # Fallback: basic auto-summary
+        return {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "summary": user_message[:200],
+            "status": "completed",
+            "project": None,
+            "details": "",
+        }
+
+    try:
+        clean = re.sub(r"```(?:json)?\s*", "", result)
+        clean = re.sub(r"\s*```", "", clean).strip()
+        parsed = json.loads(clean)
+        parsed["ts"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        return parsed
+    except (json.JSONDecodeError, ValueError):
+        return {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "summary": user_message[:200],
+            "status": "completed",
+            "project": None,
+            "details": "",
+        }
 
 
 # ─── OpenClaw Memory Loader ────────────────────────────────────────────────
@@ -1815,14 +2085,45 @@ class SessionManager:
             sys_parts.append(
                 "## Tool Permission System\n"
                 "Your tool calls go through an automated audit chain. Here's how it works:\n"
-                "- Low-risk tools (reads, file writes, searches) are auto-approved. Do NOT hesitate or explain each one.\n"
+                "- Low-risk tools (reads, file writes, searches) are auto-approved.\n"
                 "- The first tool call in a task triggers a one-time review. Once approved, ALL subsequent tools for this task execute without stopping.\n"
                 "- High-risk tools (deleting files, system commands, secrets) may be escalated to the user.\n"
                 "- If a tool is denied, you'll get a denial message. Otherwise assume approval and keep going.\n\n"
-                "IMPORTANT: Do NOT pre-explain every tool call. Do NOT batch defensively. Do NOT say 'waiting for approval'.\n"
-                "Plan your approach, then execute. The permission system handles safety — you handle the task.\n"
-                "If you need to write 20 files, write 20 files. Don't stop between each one to narrate."
+                "## Workflow Rules\n"
+                "Match your approach to what the user actually needs:\n\n"
+                "**Questions → Answer them.** If the user asks a question, ANSWER it. Do not start running tools or executing tasks.\n"
+                "  'What's in the mileage tracker .env?' → Read and tell them. Don't start modifying things.\n"
+                "  'How does the audit chain work?' → Explain it. Don't read source code unless they ask you to.\n"
+                "  'Is the deploy script ready?' → Check and report. Don't run it.\n\n"
+                "**Small tasks → Just do it.** Single commands, quick edits, file reads, web searches — execute immediately.\n"
+                "  'Get me the top news stories' → Search and return results.\n"
+                "  'Restart nginx' → Run the command.\n"
+                "  'What's in /tmp/' → List it.\n\n"
+                "**Complex tasks → Plan first.** Multi-file changes, deployments, new projects — present a brief plan before executing:\n"
+                "  1. Read relevant files to understand current state\n"
+                "  2. Present a short numbered plan (not paragraphs — just key steps)\n"
+                "  3. Execute efficiently once plan is stated\n\n"
+                "Do NOT say 'waiting for approval' or explain the permission system to the user.\n"
+                "Do NOT list tool call names (like 'Tools: Bash, Write, Read'). Focus on WHAT you're doing, not internals."
             )
+
+        # Context memory instructions
+        sys_parts.append(
+            "## Context Memory\n"
+            "You have persistent memory across sessions:\n"
+            "- MEMORY.md at /root/.openclaw/MEMORY.md — YOUR active scratchpad. Update this after completing significant tasks.\n"
+            "  Keep it concise: active projects, current state, what's pending. Remove completed items.\n"
+            "- Context from past conversations is automatically injected when relevant (in <RELEVANT_CONTEXT> tags).\n"
+            "- Chat logs are saved automatically — you don't need to manage those.\n\n"
+            "When you see <RELEVANT_CONTEXT> at the start of a message, use it to pick up where you left off.\n"
+            "The user should never have to repeat themselves if the context system found the right history.\n\n"
+            "After completing a major task or reaching a milestone, update MEMORY.md with:\n"
+            "- Project name and path\n"
+            "- What's done\n"
+            "- What's pending\n"
+            "- Key decisions or configs\n"
+            "Keep MEMORY.md under 50 lines. It's a quick reference, not a journal."
+        )
 
         if sys_parts: opts["system_prompt"] = "\n\n".join(sys_parts)
         if self.config.use_project_settings: opts["setting_sources"] = ["project"]
@@ -1856,12 +2157,13 @@ class SessionManager:
                 # Layer 1: Global threshold — based on audit risk level
                 # Layer 2: Standing approvals — override for specific patterns
                 #
-                # Risk ≤2 + both agree → silent auto-execute
-                # Risk 3  + both agree → auto-execute with notification
-                # Risk 4  + both agree → alert, wait for approval
+                # Risk ≤2 + no deny → silent auto-execute
+                # Risk 3  + no deny → auto-execute with notification
+                # Risk 4  + no deny → alert, wait for approval
                 # Risk 5  → always block
                 # Standing approval can override up to its max_risk
                 
+                verdict, risk, results = None, None, None
                 if gate._audit_chain and gate._audit_chain.is_available:
                     config = gate._config
                     auto_max = config.auto_approve_max_risk if config else 2
@@ -1872,14 +2174,14 @@ class SessionManager:
                             task_msg, tool_name, tool_input
                         )
                         real_results = [r for r in results if r.error == ""]
-                        all_approve = all(r.verdict == "approve" for r in real_results)
+                        any_deny = any(r.verdict == "deny" for r in real_results)
                         summary = real_results[0].summary if real_results else "OK"
 
                         # Check standing approval first (Layer 2 — can override global)
                         standing = gate._standing.match(tool_name, tool_input) if gate._standing else None
                         effective_max = standing.max_risk if standing else alert_max
 
-                        if all_approve and len(real_results) >= 2 and risk <= effective_max:
+                        if not any_deny and len(real_results) >= 2 and risk <= effective_max:
                             if standing:
                                 gate._standing.record_use(standing)
                             gate.task_approved[uid] = task_id
@@ -1922,17 +2224,19 @@ class SessionManager:
                             # Fall through to human approval
 
                         else:
-                            logger.info("⚠️ Audit check: verdict=%s risk=%d all_approve=%s — requesting human",
-                                       verdict, risk, all_approve)
+                            logger.info("⚠️ Audit check: verdict=%s risk=%d any_deny=%s — requesting human",
+                                       verdict, risk, any_deny)
                             # Fall through to human approval
 
                     except Exception as e:
                         logger.error("Autonomous audit error: %s", e)
+                        verdict, risk, results = None, None, None
                         # Fall through to human approval on error
 
                 # Request task-level permission (human in the loop)
                 logger.info("Requesting task permission for user %d (first tool: %s)", uid, tool_name)
-                approved = await gate.request_task_permission(uid, task_id, task_msg, tool_name, tool_input)
+                _audit = (verdict, risk, results) if verdict is not None else None
+                approved = await gate.request_task_permission(uid, task_id, task_msg, tool_name, tool_input, audit_results=_audit)
 
                 if approved:
                     # Notify agent that human approved
@@ -1993,7 +2297,8 @@ class SessionManager:
                             if isinstance(block, TextBlock): text_parts.append(block.text)
                             elif isinstance(block, ToolUseBlock): tool_log.append(block.name)
                 parts = []
-                if tool_log: parts.append("Tools: " + ", ".join(tool_log))
+                if tool_log:
+                    logger.info("Tools used: %s", ", ".join(tool_log))
                 if text_parts: parts.append("\n\n".join(text_parts))
                 return "\n\n".join(parts) if parts else "No response generated."
             except Exception as e:
@@ -2711,16 +3016,44 @@ async def handle_message(update, context):
     sessions = context.bot_data["sessions"]
     gate = context.bot_data["gate"]
 
+    # Log raw user message
+    log_chat(uid, "user", prompt)
+
     # Start a new task — clears previous task approval
     gate.start_task(uid, prompt)
+
+    # Retrieve relevant context from task index
+    audit_chain = gate._audit_chain if hasattr(gate, "_audit_chain") else None
+    context_block = ""
+    try:
+        context_block = await retrieve_context(audit_chain, prompt)
+    except Exception as e:
+        logger.debug(f"Context retrieval failed: {e}")
+
+    # Prepend context to prompt if found
+    if context_block:
+        augmented_prompt = f"{context_block}\n\n{prompt}"
+        logger.info("Injected %d chars of context", len(context_block))
+    else:
+        augmented_prompt = prompt
 
     typing_task = asyncio.create_task(keep_typing(update))
     try:
         t0 = time.monotonic()
-        response = await sessions.query(uid, prompt)
+        response = await sessions.query(uid, augmented_prompt)
         elapsed = time.monotonic() - t0
         logger.info("Response in %.1fs (%d chars)", elapsed, len(response))
-        full = response + "\n\n(%.1fs)" % elapsed
+
+        # Log raw assistant response
+        log_chat(uid, "assistant", response)
+
+        # Strip "Tools: ..." lines from the response — internal, not for the user
+        cleaned = re.sub(r"^Tools:.*\n?", "", response, flags=re.MULTILINE).strip()
+
+        # Auto-summarize and index the task (fire-and-forget)
+        asyncio.create_task(_post_task_index(audit_chain, prompt, response))
+
+        full = cleaned + "\n\n(%.1fs)" % elapsed
         for chunk in chunk_message(full, config.max_message_length):
             await update.message.reply_text(chunk)
     except Exception as e:
@@ -2731,6 +3064,17 @@ async def handle_message(update, context):
         typing_task.cancel()
         try: await typing_task
         except asyncio.CancelledError: pass
+
+
+async def _post_task_index(audit_chain, user_message, response):
+    """Fire-and-forget: summarize and index the completed task."""
+    try:
+        entry = await summarize_task(audit_chain, user_message, response)
+        if entry:
+            append_task_index(entry)
+            logger.debug("Task indexed: %s", entry.get("summary", "")[:80])
+    except Exception as e:
+        logger.debug(f"Task indexing failed: {e}")
 
 async def handle_document(update, context):
     config = context.bot_data["config"]
@@ -2785,6 +3129,15 @@ async def post_init(app):
     audit_chain = gate._audit_chain if hasattr(gate, "_audit_chain") else None
     base_dir = str(Path(__file__).parent)
     asyncio.create_task(periodic_update_check(audit_chain, perm_bot, chat_ids, base_dir))
+
+    # Initialize context memory system
+    ensure_context_dirs()
+    try:
+        prune_task_index()
+        entry_count = len(load_task_index())
+        logger.info(f"Context memory: {entry_count} task entries indexed")
+    except Exception as e:
+        logger.debug(f"Context memory init: {e}")
 
 async def post_shutdown(app):
     gate = app.bot_data.get("gate")
