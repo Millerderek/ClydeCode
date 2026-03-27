@@ -11,12 +11,12 @@ import ha_panel
 from clawcomms_bridge import ClawCommsBridge
 from pathlib import Path
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 import aiohttp
 from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 from telegram.constants import ParseMode, ChatAction
-from telegram.error import RetryAfter
+from telegram.error import RetryAfter, Conflict as TelegramConflict
 from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions, HookMatcher
 from claude_agent_sdk import AssistantMessage, TextBlock, ToolUseBlock
 from claude_agent_sdk.types import StreamEvent
@@ -100,6 +100,7 @@ CLAUDE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 CLAUDE_OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 # Refresh if token expires within this many seconds
 OAUTH_REFRESH_BUFFER_SECS = 300  # 5 minutes
+OAUTH_REFRESH_INTERVAL_SECS = 1800  # 30 minutes
 
 
 def _get_credentials_path() -> Path:
@@ -208,6 +209,23 @@ async def refresh_claude_oauth_token() -> bool:
     except Exception as e:
         logger.error("OAuth refresh: could not write credentials: %s", e)
         return False
+
+
+async def periodic_oauth_refresh():
+    """Background task that refreshes the OAuth token every OAUTH_REFRESH_INTERVAL_SECS."""
+    while True:
+        await asyncio.sleep(OAUTH_REFRESH_INTERVAL_SECS)
+        try:
+            if _is_oauth_token_expiring():
+                refreshed = await refresh_claude_oauth_token()
+                if refreshed:
+                    logger.info("Periodic OAuth refresh: token refreshed successfully")
+                else:
+                    logger.warning("Periodic OAuth refresh: refresh failed")
+            else:
+                logger.debug("Periodic OAuth refresh: token still valid, skipping")
+        except Exception as e:
+            logger.error("Periodic OAuth refresh error: %s", e)
 
 
 def detect_fork() -> dict:
@@ -633,6 +651,9 @@ async def periodic_update_check(audit_chain, permission_bot, chat_ids, base_dir)
         return
 
     logger.info(f"Update system active: normal={NORMAL_CHECK_INTERVAL}s, critical={CRITICAL_CHECK_INTERVAL}s")
+
+    # Wait for permission bot to fully initialize before first check
+    await asyncio.sleep(30)
 
     last_normal = 0
     last_critical = 0
@@ -1801,7 +1822,9 @@ class StandingApprovalStore:
                     return a
             elif a.pattern_type == "bash_contains" and tool_name == "Bash":
                 cmd = tool_input.get("command", "")
-                if a.pattern in cmd:
+                # Word-boundary match to prevent substring bypass
+                # (e.g. pattern "git" should not match "digit" or "curl ...&git")
+                if re.search(r'(?:^|(?<=\s))' + re.escape(a.pattern) + r'(?:\s|$)', cmd):
                     return a
             elif a.pattern_type == "tool" and tool_name == a.pattern:
                 return a
@@ -1901,9 +1924,9 @@ class PermissionGate:
             """Handle inline button presses for task permission."""
             query = update.callback_query
             uid = query.from_user.id
-            data = query.data  # "approve_once", "deny", or Luther question response
+            data = query.data  # "approve_once", "deny", or Clyde question response
 
-            # ── Luther question queue handler ──────────────────────────────
+            # ── Clyde question queue handler ──────────────────────────────
             import json as _json
             from pathlib import Path as _Path
             from datetime import datetime as _dt, timezone as _tz
@@ -1930,7 +1953,7 @@ class PermissionGate:
                             await query.answer(f"✅ Got it: {data}")
                             try:
                                 await query.edit_message_text(
-                                    f"🤖 <b>Luther asked:</b>\n\n{_q.get('question','')}\n\n<b>→ {data}</b>",
+                                    f"🤖 <b>Clyde asked:</b>\n\n{_q.get('question','')}\n\n<b>→ {data}</b>",
                                     parse_mode="HTML",
                                     reply_markup=None,
                                 )
@@ -1939,17 +1962,17 @@ class PermissionGate:
                             return
                     except Exception:
                         continue
-            # ── End Luther queue handler ───────────────────────────────────
+            # ── End Clyde queue handler ───────────────────────────────────
 
-            if uid not in gate.pending:
+            pending = gate.pending.pop(uid, None)
+            if pending is None:
                 await query.answer("No pending request.")
                 return
 
-            pending = gate.pending[uid]
-
+            future = pending["future"]
             if data == "deny":
-                pending["future"].set_result((False, False))
-                del gate.pending[uid]
+                if not future.done():
+                    future.set_result((False, False))
                 await query.answer("Denied")
                 try:
                     await query.edit_message_text(
@@ -1961,8 +1984,8 @@ class PermissionGate:
                         query.message.text + "\n\n❌ Task Denied"
                     )
             elif data == "approve_once":
-                pending["future"].set_result((True, False))
-                del gate.pending[uid]
+                if not future.done():
+                    future.set_result((True, False))
                 await query.answer("Task approved")
                 try:
                     await query.edit_message_text(
@@ -1989,9 +2012,10 @@ class PermissionGate:
 
             # Handle /deny
             if text == "/deny":
-                if uid in gate.pending:
-                    gate.pending[uid]["future"].set_result((False, False))
-                    del gate.pending[uid]
+                pending = gate.pending.pop(uid, None)
+                if pending is not None:
+                    if not pending["future"].done():
+                        pending["future"].set_result((False, False))
                     await update.message.reply_text("❌ Task denied.")
                 else:
                     await update.message.reply_text("No pending task.")
@@ -2012,8 +2036,9 @@ class PermissionGate:
                 pending = gate.pending[uid]
                 code = text.split()[0]
                 if code == pending["code"]:
-                    pending["future"].set_result((True, False))
-                    del gate.pending[uid]
+                    gate.pending.pop(uid, None)
+                    if not pending["future"].done():
+                        pending["future"].set_result((True, False))
                     sent = await update.message.reply_text("✅ Task approved")
                     asyncio.create_task(_delete_after(context.bot, uid, sent.message_id))
                     return
@@ -2167,7 +2192,7 @@ class PermissionGate:
             ],
         ])
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         future = loop.create_future()
         self.pending[user_id] = {
             "code": code,
@@ -2209,8 +2234,7 @@ class PermissionGate:
             return approved
         except asyncio.TimeoutError:
             logger.info("Task permission timeout for user %d", user_id)
-            if user_id in self.pending:
-                del self.pending[user_id]
+            self.pending.pop(user_id, None)
             try:
                 await self._perm_bot.send_message(chat_id=user_id, text="⏰ Task permission expired.")
             except Exception as e:
@@ -2271,7 +2295,7 @@ class Config:
     owner_name: str = "the user"   # Set via CLYDECODEBOT_OWNER_NAME
     memory_files: list[str] = field(default_factory=lambda: [
         "soul.md", "identity.md", "USER.md", "MEMORY.md",
-        "TOOLS.md", "HEARTBEAT.md", "AGENTS.md",
+        "TOOLS.md", "HEARTBEAT.md", "AGENTS.md", "BOOT.md",
     ])
     include_daily_log: bool = True
     max_message_length: int = 4096
@@ -2554,8 +2578,8 @@ async def retrieve_context(audit_chain, user_message: str) -> str:
     session_cutoff = now - (2 * 3600)
     entries = [
         e for e in entries
-        if time.mktime(time.strptime(e["ts"], "%Y-%m-%dT%H:%M:%SZ")) < session_cutoff
         if e.get("ts")
+        and time.mktime(time.strptime(e["ts"], "%Y-%m-%dT%H:%M:%SZ")) < session_cutoff
     ]
     if not entries:
         return ""
@@ -2716,12 +2740,61 @@ def load_openclaw_memory(config):
 
 class SessionManager:
     """Per-user ClaudeSDKClient sessions with OTP permission hooks."""
+
+    BUSY_KEY_PREFIX = "clyde:busy:"
+    BUSY_TTL = 300  # 5 min safety TTL — cleared explicitly on completion
+
     def __init__(self, config, gate):
         self.config = config
         self.gate = gate
         self.sessions = {}
         self.locks = {}
         self._active_user = {}  # maps session -> user_id for hook context
+        self._redis = None
+
+    def _get_redis(self):
+        """Lazy Redis connection for busy signal."""
+        if self._redis is not None:
+            try:
+                self._redis.ping()
+                return self._redis
+            except Exception:
+                self._redis = None
+        try:
+            import redis
+            self._redis = redis.Redis(host="127.0.0.1", port=6379, decode_responses=True, socket_timeout=2)
+            self._redis.ping()
+            return self._redis
+        except Exception:
+            return None
+
+    def _set_busy(self, user_id, source: str):
+        """Mark this user's session as busy with source (telegram/web)."""
+        r = self._get_redis()
+        if r:
+            try:
+                r.set(f"{self.BUSY_KEY_PREFIX}{user_id}", source, ex=self.BUSY_TTL)
+            except Exception:
+                pass
+
+    def _clear_busy(self, user_id):
+        """Clear busy signal for this user."""
+        r = self._get_redis()
+        if r:
+            try:
+                r.delete(f"{self.BUSY_KEY_PREFIX}{user_id}")
+            except Exception:
+                pass
+
+    def get_busy(self, user_id) -> str | None:
+        """Check if a session is busy. Returns source string or None."""
+        r = self._get_redis()
+        if r:
+            try:
+                return r.get(f"{self.BUSY_KEY_PREFIX}{user_id}")
+            except Exception:
+                return None
+        return None
 
     def _build_options(self, user_id):
         opts = {"cwd": self.config.working_dir}
@@ -2737,6 +2810,58 @@ class SessionManager:
         if self.config.system_prompt: sys_parts.append(self.config.system_prompt)
         last_session = load_last_session()
         if last_session: sys_parts.append(last_session)
+
+        # Core behavior framework
+        sys_parts.append(
+            "## Core Behavior Framework\n\n"
+            "Match your response mode to the complexity of the request:\n\n"
+            "### 1. SIMPLE MODE — Direct Answer\n"
+            "If the request is factual, short, or requires no assumptions:\n"
+            "→ Respond immediately and concisely. Do NOT create a plan.\n\n"
+            "### 2. PLANNING MODE — Moderate Complexity\n"
+            "If the request requires multiple steps, assumptions, or clarification:\n"
+            "Present a structured plan:\n"
+            "  PLAN:\n"
+            "  1. ...\n"
+            "  2. ...\n"
+            "  QUESTIONS: (if any)\n"
+            "  - ...\n"
+            "  Then ask: 'Do you want me to proceed, or modify anything?'\n"
+            "  DO NOT execute yet.\n\n"
+            "### 3. COMPLEX MODE — High Complexity\n"
+            "For large, multi-component, or ambiguous tasks:\n"
+            "  UNDERSTANDING: Brief restatement of the problem\n"
+            "  APPROACH: High-level breakdown\n"
+            "  OPTIONS: Option A / B / C with trade-offs\n"
+            "  Then ask: 'Am I on the right track? Which option should we proceed with?'\n"
+            "  DO NOT execute yet.\n\n"
+            "### 4. ITERATIVE REFINEMENT\n"
+            "Refine the plan based on user input. Ask follow-ups if needed.\n"
+            "Continue until the user explicitly approves.\n\n"
+            "### 5. EXECUTION MODE — Post-Approval Only\n"
+            "Only after the user says 'yes', 'proceed', 'go ahead', etc.:\n"
+            "→ Execute step-by-step\n"
+            "→ Keep output structured and efficient\n"
+            "→ After each major step, briefly report progress\n\n"
+            "### STOP / INTERRUPT MECHANISM\n"
+            "If the user says '/stop', 'stop', 'cancel', or 'abort' at ANY point:\n"
+            "IMMEDIATELY halt all processing and respond with:\n"
+            "  ⛔ Process stopped.\n"
+            "  Current status:\n"
+            "  - Last completed step: [description]\n"
+            "  - Remaining steps: [summary or 'not executed']\n"
+            "  Let me know if you want to resume, modify the plan, or start something new.\n\n"
+            "### RESUME SUPPORT\n"
+            "If the user says 'resume': confirm the previous plan and ask whether to\n"
+            "continue from the last step or restart.\n\n"
+            "### RULES\n"
+            "- Never execute complex tasks without approval\n"
+            "- Never ignore a stop command\n"
+            "- Keep plans concise and numbered\n"
+            "- Ask specific clarifying questions, not open-ended ones\n"
+            "- Prefer structured responses over prose walls\n"
+            "- FAILSAFE: if unsure which mode → default to PLANNING MODE"
+        )
 
         # Tell the agent how the permission system works
         if self.config.require_permission:
@@ -2874,18 +2999,9 @@ class SessionManager:
                                     # Silent auto-approve
                                     logger.info("🟢 Auto-approved (risk %d≤%d): %s for user %d",
                                                risk, auto_max, tool_name, uid)
-                                    # Notify agent of approval status on first tool of task
+                                    # Silent auto-approve — no chat notification
                                     if gate.task_approved.get(uid) == task_id and not gate._task_notified.get(uid):
                                         gate._task_notified[uid] = True
-                                        if gate._main_bot:
-                                            try:
-                                                sent = await gate._main_bot.send_message(
-                                                    chat_id=uid,
-                                                    text="✅ Task approved — executing",
-                                                )
-                                                asyncio.create_task(_delete_after(gate._main_bot, uid, sent.message_id))
-                                            except Exception as e:
-                                                logger.debug("Auto-approve notify failed: %s", e)
                                     log_audit_trail(uid, "approve", tool_name, tool_input, verdict, risk, "auto", summary)
                                     return {}
                                 else:
@@ -2893,17 +3009,8 @@ class SessionManager:
                                     label = "[%s] " % standing.name if standing else ""
                                     logger.info("🟡 Auto-approved+alert (risk %d): %s%s for user %d",
                                                risk, label, tool_name, uid)
-                                    if gate._main_bot:
-                                        try:
-                                            sent = await gate._main_bot.send_message(
-                                                chat_id=uid,
-                                                text="🤖 Auto-approved: %s%s\n%s (risk %d/5)" % (
-                                                    label, tool_name, summary, risk),
-                                                parse_mode=ParseMode.MARKDOWN
-                                            )
-                                            asyncio.create_task(_delete_after(gate._main_bot, uid, sent.message_id))
-                                        except Exception as e:
-                                            logger.debug("Alert notify failed: %s", e)
+                                    # Silent auto-approve with alert — no chat notification
+                                    logger.debug("Alert notify suppressed for %s (risk %d)", tool_name, risk)
                                     log_audit_trail(uid, "approve", tool_name, tool_input, verdict, risk, "standing" if standing else "auto_alert", summary)
                                     return {}
 
@@ -3020,11 +3127,23 @@ class SessionManager:
                 except Exception as e2:
                     return "Agent error: %s: %s" % (type(e2).__name__, e2)
 
-    async def query_streaming(self, user_id, prompt, on_text=None):
-        """Like query() but calls on_text(accumulated_text) as text streams in via StreamEvent."""
+    async def query_streaming(self, user_id, prompt, on_text=None, on_chunk=None, source="telegram"):
+        """Like query() but streams text as it arrives.
+
+        Callbacks:
+          on_text(accumulated)  — called with full accumulated text (Telegram uses this)
+          on_chunk(type, delta) — called with typed deltas: ("thinking", str), ("text", str),
+                                  ("tool", str).  Web SSE uses this to avoid re-sending.
+        source: "telegram" or "web" — used for busy signal in Redis.
+        """
         if user_id not in self.locks:
             self.locks[user_id] = asyncio.Lock()
         async with self.locks[user_id]:
+            # Restore per-user env vars under lock so concurrent users don't clobber each other
+            user_env = _openclaw_env.get(user_id, {})
+            for k, v in user_env.items():
+                os.environ[k] = v
+            self._set_busy(user_id, source)
             try:
                 client = await self.get_or_create(user_id)
                 await client.query(prompt)
@@ -3038,11 +3157,17 @@ class SessionManager:
                             delta = event.get("delta", {})
                             dtype = delta.get("type")
                             if dtype == "thinking_delta":
-                                thinking_buf += delta.get("thinking", "")
+                                chunk = delta.get("thinking", "")
+                                thinking_buf += chunk
+                                if on_chunk:
+                                    await on_chunk("thinking", chunk)
                                 if on_text:
                                     await on_text(f"⏳ Thinking...\n\n{thinking_buf}")
                             elif dtype == "text_delta":
-                                accumulated += delta.get("text", "")
+                                chunk = delta.get("text", "")
+                                accumulated += chunk
+                                if on_chunk:
+                                    await on_chunk("text", chunk)
                                 if on_text:
                                     await on_text(accumulated)
                     elif isinstance(msg, AssistantMessage):
@@ -3053,8 +3178,10 @@ class SessionManager:
                                     self.gate._last_plan[user_id] = block.text
                             elif isinstance(block, ToolUseBlock):
                                 tool_log.append(block.name)
+                                running = ", ".join(tool_log)
+                                if on_chunk:
+                                    await on_chunk("tool", running)
                                 if on_text:
-                                    running = ", ".join(tool_log)
                                     await on_text(f"🔧 {running}…")
                 parts = []
                 if tool_log:
@@ -3077,13 +3204,17 @@ class SessionManager:
                     return "\n\n".join(text_parts) if text_parts else "No response (retry)."
                 except Exception as e2:
                     return "Agent error: %s: %s" % (type(e2).__name__, e2)
+            finally:
+                self._clear_busy(user_id)
 
     async def destroy(self, user_id):
         if user_id in self.sessions:
             try: await self.sessions[user_id].disconnect()
             except Exception as e: logger.warning("Session disconnect error %d: %s", user_id, e)
             del self.sessions[user_id]
-            self.locks.pop(user_id, None)
+            # Don't delete the lock — it may still be held by a caller.
+            # Stale locks are harmless (lightweight asyncio.Lock objects)
+            # and will be reused if the user creates a new session.
             self.gate.clear_session(user_id)
             logger.info("Session destroyed for user %d", user_id)
 
@@ -4163,13 +4294,14 @@ async def cmd_exit(update, context):
 # ─── ML Outcome Logging ───────────────────────────────────────────────────
 
 _turn_counters = {}  # uid -> int — per-user turn counter for ML labeling
+_openclaw_env = {}   # uid -> dict — per-user env vars for openclaw-memo
 _DAEMON_SOCK = "/tmp/clyde-memo.sock"
 
 
 async def _post_log_outcome(session_id, turn_number, response_text):
     """Fire-and-forget: send log_outcome to memo daemon for ML labeling."""
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, _sync_log_outcome, session_id, turn_number, response_text)
     except Exception as e:
         logger.debug(f"log_outcome failed: {e}")
@@ -4221,9 +4353,10 @@ async def handle_message(update, context):
     _turn_counters[uid] = _turn_counters.get(uid, 0) + 1
     turn_number = _turn_counters[uid]
 
-    # Set env vars so openclaw-memo CLI can tag retrievals with session context
-    os.environ["OPENCLAW_SESSION_ID"] = f"tg-{uid}"
-    os.environ["OPENCLAW_TURN_NUMBER"] = str(turn_number)
+    # Store per-user env for openclaw-memo CLI session tagging.
+    # Restored into os.environ inside query_streaming under the per-user lock
+    # to avoid cross-user overwrites from concurrent handlers.
+    _openclaw_env[uid] = {"OPENCLAW_SESSION_ID": f"tg-{uid}", "OPENCLAW_TURN_NUMBER": str(turn_number)}
 
     # Log raw user message
     log_chat(uid, "user", prompt)
@@ -4305,11 +4438,10 @@ async def handle_message(update, context):
             await update.message.reply_text(chunk)
 
         # Save to shared web history (fire-and-forget)
-        asyncio.create_task(
-            asyncio.get_event_loop().run_in_executor(
-                None, _append_web_history, prompt, cleaned
-            )
-        )
+        async def _save_web_history():
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, _append_web_history, prompt, cleaned)
+        asyncio.create_task(_save_web_history())
     except TaskStoppedError:
         logger.info("🛑 Task stopped by user %d", uid)
         try:
@@ -4429,7 +4561,11 @@ async def handle_document(update, context):
     doc = update.message.document
     if not doc: return
     f = await context.bot.get_file(doc.file_id)
-    dest = Path(config.working_dir) / "uploads" / doc.file_name
+    # Sanitize filename to prevent path traversal (e.g. ../../etc/cron.d/evil)
+    safe_name = Path(doc.file_name).name
+    if not safe_name:
+        safe_name = f"upload_{doc.file_id}"
+    dest = Path(config.working_dir) / "uploads" / safe_name
     dest.parent.mkdir(parents=True, exist_ok=True)
     await f.download_to_drive(str(dest))
     caption = update.message.caption or ""
@@ -4479,6 +4615,11 @@ async def post_init(app):
     audit_chain = gate._audit_chain if hasattr(gate, "_audit_chain") else None
     base_dir = str(Path(__file__).parent)
     asyncio.create_task(periodic_update_check(audit_chain, perm_bot, chat_ids, base_dir))
+
+    # Start periodic OAuth token refresh (prevents mid-run expiry)
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        asyncio.create_task(periodic_oauth_refresh())
+        logger.info("  OAuth periodic refresh: every %ds", OAUTH_REFRESH_INTERVAL_SECS)
 
     # Start ClawComms bridge
     try:
@@ -4665,6 +4806,29 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_ha_callback, pattern=r"^ha_(toggle:|refresh$)"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+
+    # Self-exit on 409 Conflict so the watchdog gets a clean crash to restart from.
+    # python-telegram-bot retries Conflict internally and never crashes on its own,
+    # meaning the watchdog's "process alive" check never triggers. os._exit(1) forces
+    # an immediate exit that the watchdog detects and recovers from cleanly.
+    async def _conflict_exit_handler(update, context):
+        if isinstance(context.error, TelegramConflict):
+            logger.critical("409 Conflict: duplicate poller detected — exiting for watchdog restart")
+            os._exit(1)
+        # Re-raise all other errors for normal handling
+        raise context.error
+
+    app.add_error_handler(_conflict_exit_handler)
+
+    # ── Backlog drain: fold queued messages into memory before polling drops them ──
+    try:
+        sys.path.insert(0, "/root/ClydeMemory")
+        from backlog_drain import drain_backlog
+        drained = drain_backlog()
+        if drained:
+            logger.info(f"Backlog drain: folded {drained} messages into memory")
+    except Exception as e:
+        logger.warning(f"Backlog drain failed (non-fatal): {e}")
 
     logger.info("ClydeCodeBot live! Persistent sessions with OTP permission gate.")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)

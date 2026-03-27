@@ -1,0 +1,561 @@
+#!/root/APIKeys/venv/bin/python3
+"""clawvault — Interactive OpenClaw vault manager with user access control"""
+import sys, os, getpass
+from pathlib import Path
+
+VAULT_ENV  = Path("/etc/openclaw/vault.env")
+INJECT_DIR = Path("/root/APIKeys")
+
+def load_env():
+    if not VAULT_ENV.exists():
+        sys.exit(f"Error: {VAULT_ENV} not found.")
+    for line in VAULT_ENV.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, _, val = line.partition("=")
+            os.environ.setdefault(key.strip(), val.strip())
+
+def get_fernet():
+    from cryptography.fernet import Fernet
+    sys.path.insert(0, str(INJECT_DIR))
+    master = os.environ.get("VAULT_MASTER_KEY", "")
+    if not master:
+        sys.exit("Error: VAULT_MASTER_KEY not set")
+    return Fernet(master.encode())
+
+def get_core():
+    sys.path.insert(0, str(INJECT_DIR))
+    import vault_core as core
+    return core
+
+GREEN="\033[92m"; YELLOW="\033[93m"; RED="\033[91m"
+CYAN="\033[96m"; BOLD="\033[1m"; DIM="\033[2m"; RESET="\033[0m"
+
+def clear():
+    os.system("clear")
+
+def header():
+    caller = _get_caller()
+    role = "root" if _caller_is_root() else "user"
+    print(f"{CYAN}{BOLD}")
+    print("  ╔═══════════════════════════════╗")
+    print("  ║      ClawVault Manager        ║")
+    print("  ╚═══════════════════════════════╝")
+    print(f"{RESET}")
+    if not _caller_is_root():
+        print(f"  {DIM}Logged in as: {CYAN}{caller}{DIM} (restricted){RESET}\n")
+
+# ── Caller identity ──────────────────────────────────────────────────────
+
+def _get_caller():
+    """Get actual calling user (respects sudo)."""
+    sudo_user = os.environ.get("SUDO_USER", "")
+    if sudo_user:
+        return sudo_user
+    import pwd
+    try:
+        return pwd.getpwuid(os.getuid()).pw_name
+    except KeyError:
+        return str(os.getuid())
+
+def _caller_is_root():
+    """True if actual caller is root (not sudoing from another user)."""
+    return os.getuid() == 0 and not os.environ.get("SUDO_USER", "")
+
+def _require_root(action="this action"):
+    if not _caller_is_root():
+        print(f"  {RED}✗ Access denied — {action} requires root.{RESET}")
+        return False
+    return True
+
+def _check_acl(core, key_name, need="r"):
+    """Check if current caller can access key_name. Root always passes."""
+    if _caller_is_root():
+        return True
+    caller = _get_caller()
+    if core.acl_check(caller, key_name, need):
+        return True
+    perm_label = "read" if need == "r" else "write"
+    print(f"  {RED}✗ Access denied — no {perm_label} permission for {key_name}{RESET}")
+    core.audit(f"acl_denied_{perm_label}", caller, "localhost", key_name, success=False)
+    return False
+
+def _get_visible_keys(core, vault_keys, need="r"):
+    """Filter keys to only those the caller can see."""
+    if _caller_is_root():
+        return vault_keys
+    caller = _get_caller()
+    return core.acl_filter_keys(caller, vault_keys, need)
+
+# ── Menu ─────────────────────────────────────────────────────────────────
+
+def menu():
+    is_root = _caller_is_root()
+    print(f"  {BOLD}1){RESET} List keys")
+    print(f"  {BOLD}2){RESET} Add key")
+    print(f"  {BOLD}3){RESET} Rotate key")
+    print(f"  {BOLD}4){RESET} Delete key")
+    print(f"  {BOLD}5){RESET} Show key value")
+    print(f"  {BOLD}6){RESET} Export (update runtime config)")
+    if is_root:
+        print(f"  {BOLD}7){RESET} {CYAN}User Access (ACL){RESET}")
+    print(f"  {BOLD}0){RESET} Exit")
+    print()
+
+def prompt(msg):
+    try:
+        return input(msg).strip()
+    except (KeyboardInterrupt, EOFError):
+        print("\nAborted.")
+        return ""
+
+def pause():
+    input(f"\n{DIM}Press Enter to continue...{RESET}")
+
+# ── Key operations (ACL-enforced) ────────────────────────────────────────
+
+def do_list(core, fernet):
+    vault = core.load_vault(fernet)
+    if not vault:
+        print(f"\n{YELLOW}Vault is empty.{RESET}")
+        return
+
+    visible = _get_visible_keys(core, sorted(vault.keys()))
+    if not visible:
+        print(f"\n  {YELLOW}No keys accessible to you.{RESET}")
+        return
+
+    ages = core.get_key_ages(list(vault.keys()))
+    caller = _get_caller()
+
+    # Show permission column for non-root users
+    if _caller_is_root():
+        print(f"\n  {BOLD}{'Key':<32} {'Age':>10}{RESET}")
+        print("  " + "─" * 44)
+    else:
+        print(f"\n  {BOLD}{'Key':<32} {'Age':>10} {'Perm':>6}{RESET}")
+        print("  " + "─" * 52)
+
+    for name in visible:
+        age_info = ages.get(name, {})
+        days     = age_info.get("days_since_rotation")
+        age_str  = f"{days}d" if days is not None else "unknown"
+        stale    = age_info.get("stale", False)
+        colour   = YELLOW if stale else RESET
+        flag     = " ⚠" if stale else ""
+
+        if _caller_is_root():
+            print(f"  {colour}{name:<32} {age_str:>10}{flag}{RESET}")
+        else:
+            # Show user's permission level
+            perm = ""
+            acl_data = core.acl_list()
+            user_entry = acl_data.get(caller, {})
+            perms = user_entry.get("permissions", {})
+            import fnmatch
+            for pat, p in perms.items():
+                if fnmatch.fnmatch(name, pat) or fnmatch.fnmatch(name.upper(), pat.upper()):
+                    perm = p
+                    break
+            perm_display = {"r": "read", "w": "write", "rw": "r/w"}.get(perm, "?")
+            print(f"  {colour}{name:<32} {age_str:>10} {DIM}{perm_display:>6}{RESET}{flag}")
+
+    total = len(vault)
+    shown = len(visible)
+    if shown < total and not _caller_is_root():
+        print(f"\n  {DIM}{shown} of {total} key(s) visible to you{RESET}")
+    else:
+        print(f"\n  {DIM}{total} key(s){RESET}")
+
+    core.audit("cli_key_list", _get_caller(), "localhost", f"viewed {shown} keys")
+
+def do_add(core, fernet, rotate=False):
+    vault = core.load_vault(fernet)
+
+    if rotate:
+        keys = _get_visible_keys(core, sorted(vault.keys()), need="w")
+        if not keys:
+            print(f"\n{YELLOW}No writable keys available.{RESET}")
+            return
+        print(f"\n  {BOLD}Available keys:{RESET}")
+        for i, k in enumerate(keys, 1):
+            print(f"  {i}) {k}")
+        choice = prompt("\n  Select number or type key name: ")
+        if choice.isdigit() and 1 <= int(choice) <= len(keys):
+            name = keys[int(choice) - 1]
+        else:
+            name = choice.upper()
+    else:
+        if not _caller_is_root():
+            # Non-root can only add keys they have write access to
+            name = prompt("\n  Key name (e.g. GROK_API_KEY): ").upper()
+            if name and not _check_acl(core, name, "w"):
+                return
+        else:
+            name = prompt("\n  Key name (e.g. GROK_API_KEY): ").upper()
+
+    if not name:
+        return
+
+    if not _check_acl(core, name, "w"):
+        return
+
+    if name in vault and not rotate:
+        confirm = prompt(f"  {YELLOW}{name} exists. Overwrite? [y/N]{RESET} ")
+        if confirm.lower() != "y":
+            print("  Aborted.")
+            return
+
+    value = getpass.getpass(f"  Value for {CYAN}{name}{RESET}: ")
+    if not value.strip():
+        print(f"  {RED}Empty value not allowed.{RESET}")
+        return
+
+    is_new      = name not in vault
+    vault[name] = value
+    core.save_vault(fernet, vault)
+    core.track_key_write(name, is_new)
+    core.write_backup(fernet)
+    caller = _get_caller()
+    core.audit(f"cli_key_{'created' if is_new else 'updated'}", caller, "localhost", name)
+    verb = "Added" if is_new else "Updated"
+    print(f"\n  {GREEN}✓ {verb}: {name}{RESET}")
+    if _caller_is_root():
+        print(f"  {DIM}Run Export (6) to update runtime config.{RESET}")
+
+def do_delete(core, fernet):
+    if not _require_root("delete keys"):
+        return
+
+    vault = core.load_vault(fernet)
+    keys  = sorted(vault.keys())
+    if not keys:
+        print(f"\n{YELLOW}Vault is empty.{RESET}")
+        return
+    print(f"\n  {BOLD}Available keys:{RESET}")
+    for i, k in enumerate(keys, 1):
+        print(f"  {i}) {k}")
+    choice = prompt("\n  Select number or type key name: ")
+    if choice.isdigit() and 1 <= int(choice) <= len(keys):
+        name = keys[int(choice) - 1]
+    else:
+        name = choice.upper()
+    if name not in vault:
+        print(f"  {RED}Not found: {name}{RESET}")
+        return
+    confirm = prompt(f"  {RED}Delete {name}? [y/N]{RESET} ")
+    if confirm.lower() != "y":
+        print("  Aborted.")
+        return
+    del vault[name]
+    core.save_vault(fernet, vault)
+    core.write_backup(fernet)
+    core.audit("cli_key_deleted", "cli", "localhost", name)
+    print(f"\n  {GREEN}✓ Deleted: {name}{RESET}")
+
+def do_show(core, fernet):
+    vault = core.load_vault(fernet)
+    keys  = _get_visible_keys(core, sorted(vault.keys()), need="r")
+    if not keys:
+        print(f"\n{YELLOW}No readable keys available.{RESET}")
+        return
+    print(f"\n  {BOLD}Available keys:{RESET}")
+    for i, k in enumerate(keys, 1):
+        print(f"  {i}) {k}")
+    choice = prompt("\n  Select number or type key name: ")
+    if choice.isdigit() and 1 <= int(choice) <= len(keys):
+        name = keys[int(choice) - 1]
+    else:
+        name = choice.upper()
+    if name not in vault:
+        print(f"  {RED}Not found: {name}{RESET}")
+        return
+    if not _check_acl(core, name, "r"):
+        return
+    confirm = prompt(f"  {YELLOW}Show plaintext for {name}? [y/N]{RESET} ")
+    if confirm.lower() != "y":
+        print("  Aborted.")
+        return
+    caller = _get_caller()
+    core.audit("cli_key_viewed", caller, "localhost", name)
+    print(f"\n  {CYAN}{name}{RESET} = {vault[name]}\n")
+
+def do_export():
+    if not _require_root("export"):
+        return
+    inject = INJECT_DIR / "openclaw_boot_inject.py"
+    python = INJECT_DIR / "venv" / "bin" / "python3"
+    if not inject.exists():
+        print(f"  {RED}Error: {inject} not found{RESET}")
+        return
+    print(f"\n  {BOLD}Running boot injector...{RESET}\n")
+    os.execv(str(python), [str(python), str(inject), "--write"])
+
+# ── User Access (ACL) submenu — root only ────────────────────────────────
+
+def do_user_access(core):
+    if not _require_root("manage user access"):
+        return
+
+    while True:
+        clear()
+        print(f"{CYAN}{BOLD}")
+        print("  ╔═══════════════════════════════╗")
+        print("  ║       User Access (ACL)        ║")
+        print("  ╚═══════════════════════════════╝")
+        print(f"{RESET}")
+
+        # Show current ACL
+        users = core.acl_list()
+        if users:
+            print(f"  {BOLD}Current permissions:{RESET}\n")
+            print(f"  {BOLD}{'User':<16} {'Key Pattern':<28} {'Access':>8}{RESET}")
+            print("  " + "─" * 54)
+            for username in sorted(users.keys()):
+                entry = users[username]
+                perms = entry.get("permissions", {})
+                first = True
+                for pattern, perm in sorted(perms.items()):
+                    perm_display = {"r": "read", "w": "write", "rw": "r/w"}.get(perm, perm)
+                    colour = GREEN if perm == "rw" else (CYAN if perm == "r" else YELLOW)
+                    uname = username if first else ""
+                    print(f"  {uname:<16} {pattern:<28} {colour}{perm_display:>8}{RESET}")
+                    first = False
+            print()
+        else:
+            print(f"  {DIM}No users configured.{RESET}\n")
+
+        print(f"  {BOLD}1){RESET} Add user / grant access")
+        print(f"  {BOLD}2){RESET} Modify user permissions")
+        print(f"  {BOLD}3){RESET} Revoke key access")
+        print(f"  {BOLD}4){RESET} Remove user entirely")
+        print(f"  {BOLD}0){RESET} Back to main menu")
+        print()
+
+        choice = prompt("  Select: ")
+
+        if choice == "1":
+            _acl_add_user(core)
+            pause()
+        elif choice == "2":
+            _acl_modify_user(core)
+            pause()
+        elif choice == "3":
+            _acl_revoke_key(core)
+            pause()
+        elif choice == "4":
+            _acl_remove_user(core)
+            pause()
+        elif choice == "0":
+            break
+        else:
+            print(f"  {YELLOW}Invalid option.{RESET}")
+            pause()
+
+
+def _acl_add_user(core):
+    """Add a new user or grant additional key access."""
+    print(f"\n  {BOLD}Grant Key Access{RESET}\n")
+
+    username = prompt("  Linux username: ").strip()
+    if not username:
+        return
+
+    # Validate the user exists on the system
+    import pwd
+    try:
+        pwd.getpwnam(username)
+    except KeyError:
+        confirm = prompt(f"  {YELLOW}User '{username}' not found on system. Continue anyway? [y/N]{RESET} ")
+        if confirm.lower() != "y":
+            return
+
+    key_pattern = prompt("  Key pattern (exact name or wildcard, e.g. OPENROUTER_*, *): ").strip()
+    if not key_pattern:
+        return
+
+    print(f"\n  {BOLD}Permission levels:{RESET}")
+    print(f"    {BOLD}r{RESET}  — Read only (list + view key values)")
+    print(f"    {BOLD}w{RESET}  — Write only (add + rotate keys)")
+    print(f"    {BOLD}rw{RESET} — Full access (read + write)")
+    print()
+
+    perm = prompt("  Permission [r/w/rw]: ").strip().lower()
+    if perm not in ("r", "w", "rw"):
+        print(f"  {RED}Invalid — use 'r', 'w', or 'rw'{RESET}")
+        return
+
+    perm_label = {"r": "read", "w": "write", "rw": "read/write"}.get(perm)
+    confirm = prompt(f"\n  Grant {CYAN}{username}{RESET} {GREEN}{perm_label}{RESET} access to {CYAN}{key_pattern}{RESET}? [y/N] ")
+    if confirm.lower() != "y":
+        print("  Aborted.")
+        return
+
+    core.acl_grant(username, key_pattern, perm, granted_by=_get_caller())
+    print(f"\n  {GREEN}✓ Granted {perm_label} on '{key_pattern}' to {username}{RESET}")
+    print(f"  {DIM}User can access via: sudo clawvault{RESET}")
+
+
+def _acl_modify_user(core):
+    """Modify an existing user's permissions."""
+    users = core.acl_list()
+    if not users:
+        print(f"\n  {YELLOW}No users configured.{RESET}")
+        return
+
+    usernames = sorted(users.keys())
+    print(f"\n  {BOLD}Select user:{RESET}")
+    for i, u in enumerate(usernames, 1):
+        n_perms = len(users[u].get("permissions", {}))
+        print(f"  {i}) {u} ({n_perms} rule{'s' if n_perms != 1 else ''})")
+
+    choice = prompt("\n  Select number or type username: ")
+    if choice.isdigit() and 1 <= int(choice) <= len(usernames):
+        username = usernames[int(choice) - 1]
+    else:
+        username = choice.strip()
+
+    if username not in users:
+        print(f"  {RED}User not found: {username}{RESET}")
+        return
+
+    # Show current permissions and let them add another rule
+    entry = users[username]
+    perms = entry.get("permissions", {})
+    print(f"\n  {BOLD}Current permissions for {CYAN}{username}{RESET}:")
+    for pat, p in sorted(perms.items()):
+        perm_display = {"r": "read", "w": "write", "rw": "r/w"}.get(p, p)
+        print(f"    {pat:<28} → {perm_display}")
+
+    print(f"\n  Add another key pattern for this user:")
+    key_pattern = prompt("  Key pattern: ").strip()
+    if not key_pattern:
+        return
+
+    perm = prompt("  Permission [r/w/rw]: ").strip().lower()
+    if perm not in ("r", "w", "rw"):
+        print(f"  {RED}Invalid — use 'r', 'w', or 'rw'{RESET}")
+        return
+
+    core.acl_grant(username, key_pattern, perm, granted_by=_get_caller())
+    perm_label = {"r": "read", "w": "write", "rw": "read/write"}.get(perm)
+    print(f"\n  {GREEN}✓ Updated: {username} now has {perm_label} on '{key_pattern}'{RESET}")
+
+
+def _acl_revoke_key(core):
+    """Revoke a specific key pattern from a user."""
+    users = core.acl_list()
+    if not users:
+        print(f"\n  {YELLOW}No users configured.{RESET}")
+        return
+
+    usernames = sorted(users.keys())
+    print(f"\n  {BOLD}Select user:{RESET}")
+    for i, u in enumerate(usernames, 1):
+        print(f"  {i}) {u}")
+
+    choice = prompt("\n  Select number or type username: ")
+    if choice.isdigit() and 1 <= int(choice) <= len(usernames):
+        username = usernames[int(choice) - 1]
+    else:
+        username = choice.strip()
+
+    if username not in users:
+        print(f"  {RED}User not found: {username}{RESET}")
+        return
+
+    perms = users[username].get("permissions", {})
+    patterns = sorted(perms.keys())
+    if not patterns:
+        print(f"  {YELLOW}No permissions to revoke.{RESET}")
+        return
+
+    print(f"\n  {BOLD}Permissions for {CYAN}{username}{RESET}:")
+    for i, pat in enumerate(patterns, 1):
+        p = perms[pat]
+        perm_display = {"r": "read", "w": "write", "rw": "r/w"}.get(p, p)
+        print(f"  {i}) {pat} → {perm_display}")
+
+    choice = prompt("\n  Select number to revoke: ")
+    if choice.isdigit() and 1 <= int(choice) <= len(patterns):
+        pattern = patterns[int(choice) - 1]
+    else:
+        pattern = choice.strip()
+
+    if pattern not in perms:
+        print(f"  {RED}Pattern not found: {pattern}{RESET}")
+        return
+
+    confirm = prompt(f"  {RED}Revoke '{pattern}' from {username}? [y/N]{RESET} ")
+    if confirm.lower() != "y":
+        print("  Aborted.")
+        return
+
+    core.acl_revoke(username, pattern)
+    print(f"\n  {GREEN}✓ Revoked '{pattern}' from {username}{RESET}")
+
+
+def _acl_remove_user(core):
+    """Remove a user and all their permissions."""
+    users = core.acl_list()
+    if not users:
+        print(f"\n  {YELLOW}No users configured.{RESET}")
+        return
+
+    usernames = sorted(users.keys())
+    print(f"\n  {BOLD}Select user to remove:{RESET}")
+    for i, u in enumerate(usernames, 1):
+        n_perms = len(users[u].get("permissions", {}))
+        print(f"  {i}) {u} ({n_perms} rule{'s' if n_perms != 1 else ''})")
+
+    choice = prompt("\n  Select number or type username: ")
+    if choice.isdigit() and 1 <= int(choice) <= len(usernames):
+        username = usernames[int(choice) - 1]
+    else:
+        username = choice.strip()
+
+    if username not in users:
+        print(f"  {RED}User not found: {username}{RESET}")
+        return
+
+    confirm = prompt(f"  {RED}Remove {username} and ALL their permissions? [y/N]{RESET} ")
+    if confirm.lower() != "y":
+        print("  Aborted.")
+        return
+
+    core.acl_revoke(username)
+    print(f"\n  {GREEN}✓ Removed user: {username}{RESET}")
+
+
+# ── Main ─────────────────────────────────────────────────────────────────
+
+def main():
+    load_env()
+    core   = get_core()
+    fernet = get_fernet()
+    while True:
+        clear()
+        header()
+        menu()
+        choice = prompt("  Select: ")
+        if choice == "1":
+            clear(); header(); do_list(core, fernet); pause()
+        elif choice == "2":
+            clear(); header(); do_add(core, fernet, rotate=False); pause()
+        elif choice == "3":
+            clear(); header(); do_add(core, fernet, rotate=True); pause()
+        elif choice == "4":
+            clear(); header(); do_delete(core, fernet); pause()
+        elif choice == "5":
+            clear(); header(); do_show(core, fernet); pause()
+        elif choice == "6":
+            clear(); header(); do_export()
+        elif choice == "7" and _caller_is_root():
+            do_user_access(core)
+        elif choice == "0":
+            print(f"\n  {DIM}Bye.{RESET}\n"); break
+        else:
+            print(f"  {YELLOW}Invalid option.{RESET}"); pause()
+
+if __name__ == "__main__":
+    main()

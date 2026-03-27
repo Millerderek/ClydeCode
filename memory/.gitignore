@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.env
+secrets/
+*.sock
+*.pid
+.digest_state.json
+.compaction_watcher_state.json
+.session_ingest_state.json

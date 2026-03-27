@@ -1,0 +1,14 @@
+# ClydeMemory cron schedule
+# Add to crontab with: crontab -e
+
+# Hot-ingest: catch recently active sessions every 5 minutes
+*/5 * * * * cd /path/to/clyde-memory && python3 compaction_watcher.py >> /var/log/clyde-compaction-watcher.log 2>&1
+
+# Session ingest: process session markdown files every 2 minutes
+*/2 * * * * cd /path/to/clyde-memory && python3 session_ingest.py >> /var/log/clyde-session-ingest.log 2>&1
+
+# Custodian: maintenance every 30 minutes
+*/30 * * * * cd /path/to/clyde-memory && python3 openclaw_custodian.py run >> /var/log/clyde-custodian.log 2>&1
+
+# Deep digest: full extraction every 4 hours
+0 */4 * * * cd /path/to/clyde-memory && python3 conversation_digest.py >> /var/log/clyde-conversation-digest.log 2>&1

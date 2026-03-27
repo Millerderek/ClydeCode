@@ -8,10 +8,23 @@ venv/
 dist/
 build/
 node_modules/
+*.bak
+*.log
+
+# Runtime state (not source)
 memory/secrets/pg_password.txt
 memory/.session_ingest_state.json
+memory/logs/
 standing_approvals.json
 auditors.json
 alert_key.pem
 alert_config.json
-*.bak
+
+# Bridge runtime state
+bridge/.digest_state.json
+
+# Vault runtime (keys are never tracked)
+clawvault/*.env
+clawvault/*.enc
+clawvault/backups/
+clawvault/vault_acl.json

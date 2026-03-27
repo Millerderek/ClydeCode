@@ -7,6 +7,7 @@ Listens on 127.0.0.1:8765 — proxied by Next.js API routes, never public.
 
 Endpoints:
   GET  /health          → {"status":"ok"}
+  GET  /status          → {"busy":true,"source":"telegram"} or {"busy":false}
   POST /chat            → SSE stream of {"type":"token","text":"…"} + {"type":"done"}
   POST /stop            → cancel active stream for owner → {"ok":true}
 """
@@ -22,7 +23,7 @@ logger = logging.getLogger("web_api")
 
 # ─── Active stream registry ──────────────────────────────────────────────────
 # Maps owner_id → the asyncio.Task running query_streaming for that user.
-# Allows /stop to cancel mid-flight.
+# Allows /stop to cancel mid-flight (from any interface).
 _active_tasks: dict[int, asyncio.Task] = {}
 
 
@@ -45,6 +46,19 @@ def _check_auth(request: web.Request) -> bool:
 
 async def handle_health(request: web.Request) -> web.Response:
     return web.json_response({"status": "ok"})
+
+
+async def handle_status(request: web.Request) -> web.Response:
+    """Check if the session is currently busy (via Redis busy signal)."""
+    if not _check_auth(request):
+        return web.json_response({"error": "Unauthorized"}, status=401)
+
+    sessions = request.app["sessions"]
+    owner_id = request.app["owner_id"]
+    source = sessions.get_busy(owner_id)
+    if source:
+        return web.json_response({"busy": True, "source": source})
+    return web.json_response({"busy": False, "source": None})
 
 
 async def handle_stop(request: web.Request) -> web.Response:
@@ -97,44 +111,22 @@ async def handle_chat(request: web.Request) -> web.StreamResponse:
         except Exception:
             client_gone = True  # client disconnected — stop writing, don't raise
 
-    # Phase tracking: on_text is called with different content shapes across phases:
-    #   thinking  → "⏳ Thinking...\n\n<accumulated thinking>"
-    #   tool_use  → "🔧 Tool1, Tool2…"
-    #   response  → plain accumulated response text (resets to "" each turn)
-    # prev_len tracks the last write position within the CURRENT phase's string.
-    prev_len = 0
-    prev_phase: str = ''
-
-    async def on_text(accumulated: str):
-        nonlocal prev_len, prev_phase
-
-        if accumulated.startswith('⏳ Thinking...'):
-            if prev_phase != 'thinking':
-                prev_phase = 'thinking'
-                prev_len = len('⏳ Thinking...\n\n')  # skip static prefix
-            new_text = accumulated[prev_len:]
-            if new_text:
-                await send({"type": "thinking", "text": new_text})
-                prev_len = len(accumulated)
-
-        elif accumulated.startswith('🔧'):
-            prev_phase = 'tool'
-            prev_len = 0
-            await send({"type": "tool_status", "text": accumulated})
-
-        else:
-            # Response text — resets each query turn
-            if prev_phase != 'response':
-                prev_phase = 'response'
-                prev_len = 0
-            new_text = accumulated[prev_len:]
-            if new_text:
-                await send({"type": "token", "text": new_text})
-                prev_len = len(accumulated)
+    # Delta-based streaming: on_chunk receives typed deltas directly,
+    # no phase tracking or accumulated-text deduplication needed.
+    async def on_chunk(chunk_type: str, delta: str):
+        if not delta:
+            return
+        if chunk_type == "thinking":
+            await send({"type": "thinking", "text": delta})
+        elif chunk_type == "text":
+            await send({"type": "token", "text": delta})
+        elif chunk_type == "tool":
+            # Suppress tool status from web UI — thinking spinner covers this
+            pass
 
     # Wrap query_streaming in a Task so /stop can cancel it
     async def run_query():
-        await sessions.query_streaming(owner_id, message, on_text=on_text)
+        await sessions.query_streaming(owner_id, message, on_chunk=on_chunk, source="web")
 
     task = asyncio.create_task(run_query())
     _active_tasks[owner_id] = task
@@ -151,7 +143,10 @@ async def handle_chat(request: web.Request) -> web.StreamResponse:
     finally:
         _active_tasks.pop(owner_id, None)
 
-    await resp.write_eof()
+    try:
+        await resp.write_eof()
+    except Exception:
+        pass  # client already closed — safe to ignore
     return resp
 
 
@@ -161,7 +156,8 @@ def create_app(sessions, owner_id: int) -> web.Application:
     app = web.Application()
     app["sessions"] = sessions
     app["owner_id"] = owner_id
-    app.router.add_get("/health", handle_health)
+    app.router.add_get("/health",  handle_health)
+    app.router.add_get("/status",  handle_status)
     app.router.add_post("/chat",   handle_chat)
     app.router.add_post("/stop",   handle_stop)
     return app

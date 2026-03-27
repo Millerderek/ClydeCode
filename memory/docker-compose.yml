@@ -1,0 +1,105 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# ClydeMemory Stack — Docker Compose
+# Qdrant (vectors) + PostgreSQL (metadata/keyscores) + Redis (cache/pre-filter)
+#
+# All services bound to 127.0.0.1 — fully private, no network exposure.
+# Persistent volumes survive container restarts/upgrades.
+#
+# Usage:
+#   docker compose up -d          Start all services
+#   docker compose down           Stop all services
+#   docker compose logs -f        Tail logs
+#   docker compose ps             Check status
+# ═══════════════════════════════════════════════════════════════════════════════
+
+version: '3.8'
+
+services:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Qdrant — Vector Store (semantic memory)
+  # Stores embeddings for conversational memories, searchable via cosine similarity
+  # API: http://127.0.0.1:6333   Dashboard: http://127.0.0.1:6333/dashboard
+  # ─────────────────────────────────────────────────────────────────────────────
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: clyde-memory-qdrant-1
+    ports:
+      - "127.0.0.1:6333:6333"    # REST API
+      - "127.0.0.1:6334:6334"    # gRPC (optional, for high-perf clients)
+    volumes:
+      - qdrant_data:/qdrant/storage
+      - qdrant_snapshots:/qdrant/snapshots
+    environment:
+      - QDRANT__SERVICE__GRPC_PORT=6334
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/6333'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # PostgreSQL — Metadata Store (keyscores, confidence, TTLs, entity tags)
+  # Structured data about memories: who said it, when, confidence level,
+  # access counts, contradiction flags, decay timers
+  # ─────────────────────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: clyde-memory-postgres-1
+    ports:
+      - "127.0.0.1:5432:5432"
+    environment:
+      POSTGRES_DB: ${CLYDE_PG_DB:-clyde_memory}
+      POSTGRES_USER: ${CLYDE_PG_USER:-clyde}
+      POSTGRES_PASSWORD: ${CLYDE_PG_PASSWORD:-changeme}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${CLYDE_PG_USER:-clyde} -d ${CLYDE_PG_DB:-clyde_memory}"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Redis — Cache Layer (entity indices, keyscore cache, pre-filter lookups)
+  # Fast key-value store for the heuristic pre-filter stage.
+  # Entity→memory mappings served in microseconds before vector search runs.
+  # ─────────────────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: clyde-memory-redis-1
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    command: >
+      redis-server
+        --appendonly yes
+        --maxmemory 256mb
+        --maxmemory-policy allkeys-lru
+        --save 60 100
+        --save 300 10
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Persistent Volumes
+# ═══════════════════════════════════════════════════════════════════════════════
+volumes:
+  qdrant_data:
+    name: clyde-memory_qdrant_data
+  qdrant_snapshots:
+    name: clyde-memory_qdrant_snapshots
+  pg_data:
+    name: clyde-memory_pg_data
+  redis_data:
+    name: clyde-memory_redis_data
