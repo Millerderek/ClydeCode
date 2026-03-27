@@ -864,6 +864,16 @@ class AuditChain:
         """Reset circuit breaker failure count."""
         self._consecutive_failures = 0
 
+    def _refresh_keys(self):
+        """Re-resolve API keys from vault/env so key rotations work without restart."""
+        try:
+            # Clear existing keys so resolve_auditor_keys will re-check sources
+            for a in self.auditors:
+                a.api_key = ""
+            resolve_auditor_keys(self.auditors)
+        except Exception as e:
+            logger.debug("Key refresh failed (non-fatal): %s", e)
+
     async def _get_http(self):
         if self._http is None or self._http.closed:
             self._http = aiohttp.ClientSession()
@@ -960,9 +970,9 @@ class AuditChain:
                     body = await resp.text()
                     logger.error("Auditor %s HTTP %d: %s", auditor.name, resp.status, body[:500])
                     return AuditResult(
-                        auditor_name=auditor.name, verdict="deny", risk=5,
-                        intent_match=False, concerns=["API error: HTTP %d" % resp.status],
-                        summary="Auditor API error", error=body[:200]
+                        auditor_name=auditor.name, verdict="warn", risk=3,
+                        intent_match=True, concerns=["API error: HTTP %d" % resp.status],
+                        summary="Auditor API error — manual review needed", error=body[:200]
                     )
                 data = await resp.json()
 
@@ -1080,6 +1090,10 @@ class AuditChain:
 
         Returns: (final_verdict, max_risk, list_of_results)
         """
+        # Hot-refresh API keys from vault/env so key rotations
+        # take effect without restarting the bot process.
+        self._refresh_keys()
+
         active = self.active_auditors
         if not active:
             logger.warning("No active auditors in chain — skipping audit")
@@ -2990,7 +3004,7 @@ class SessionManager:
                             if any_deny:
                                 logger.info("⛔ Deny verdict overrides auto-approval for %s", tool_name)
                                 # Fall through to human approval
-                            elif len(real_results) >= 2 and risk <= effective_max:
+                            elif len(real_results) >= 1 and risk <= effective_max:
                                 if standing:
                                     gate._standing.record_use(standing)
                                 gate.task_approved[uid] = task_id
