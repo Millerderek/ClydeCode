@@ -36,7 +36,8 @@ def _get_token() -> str:
 def _check_auth(request: web.Request) -> bool:
     token = _get_token()
     if not token:
-        return True  # no token set → open (only safe because it's loopback-only)
+        logger.warning("WEB_API_TOKEN not set — rejecting request (set token in .env to enable API)")
+        return False  # deny by default — require explicit token configuration
     auth = request.headers.get("Authorization", "")
     supplied = auth.removeprefix("Bearer ").strip()
     return supplied == token

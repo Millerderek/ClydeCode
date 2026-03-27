@@ -45,10 +45,18 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message
 def build_system_prompt() -> str:
     """Read workspace .md files and assemble a system prompt."""
     parts = []
+    # Allowed symlink targets — only resolve to known safe directories
+    ALLOWED_SYMLINK_PARENTS = [Path("/root/.openclaw"), Path("/root/ClydeMemory")]
+
     for fname in SYSTEM_PROMPT_FILES:
         fpath = WORKSPACE / fname
         if fpath.is_symlink():
-            fpath = fpath.resolve()
+            resolved = fpath.resolve()
+            # Prevent symlink traversal to arbitrary files
+            if not any(str(resolved).startswith(str(p)) for p in ALLOWED_SYMLINK_PARENTS):
+                LOG.warning(f"Symlink {fname} points outside allowed dirs: {resolved} — skipping")
+                continue
+            fpath = resolved
         if fpath.exists():
             content = fpath.read_text().strip()
             if content:
@@ -119,11 +127,47 @@ sessions = SessionManager()
 # ---------------------------------------------------------------------------
 # Claude Code query wrapper
 # ---------------------------------------------------------------------------
+
+# Dangerous command patterns that should never be auto-approved
+BLOCKED_COMMANDS = [
+    "rm -rf /", "rm -rf /*", "mkfs", "dd if=", "shutdown", "reboot",
+    "halt", "poweroff", "init 0", "init 6",
+    "> /dev/sd", "chmod -R 777 /", "chown -R",
+    "curl | sh", "curl | bash", "wget | sh", "wget | bash",
+    "DROP DATABASE", "DROP TABLE", "TRUNCATE",
+    "passwd", "userdel", "deluser",
+]
+
+# Paths that should not be written to or deleted
+PROTECTED_PATHS = [
+    "/etc/passwd", "/etc/shadow", "/etc/sudoers",
+    "/root/.ssh/", "/boot/", "/usr/bin/", "/usr/sbin/",
+]
+
+
 async def approve_all_tools(
     tool_name: str, tool_input: dict, context: "ToolPermissionContext"
 ) -> "PermissionResult":
-    """Auto-approve all tool calls — we trust ourselves."""
-    from claude_agent_sdk import PermissionResultAllow
+    """Auto-approve tool calls with safety blocklist for destructive operations."""
+    from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
+
+    # Check Bash commands against blocklist
+    if tool_name == "Bash":
+        cmd = str(tool_input.get("command", "")).strip()
+        cmd_lower = cmd.lower()
+        for blocked in BLOCKED_COMMANDS:
+            if blocked.lower() in cmd_lower:
+                LOG.warning(f"BLOCKED tool call: {tool_name} — matched '{blocked}' in: {cmd[:100]}")
+                return PermissionResultDeny(reason=f"Blocked: command matches dangerous pattern '{blocked}'")
+
+    # Check file operations against protected paths
+    if tool_name in ("Write", "Edit"):
+        path = str(tool_input.get("file_path", ""))
+        for protected in PROTECTED_PATHS:
+            if path.startswith(protected):
+                LOG.warning(f"BLOCKED tool call: {tool_name} on protected path: {path}")
+                return PermissionResultDeny(reason=f"Blocked: cannot modify protected path '{protected}'")
+
     return PermissionResultAllow()
 
 
