@@ -205,6 +205,8 @@ async def run_claude_turn(messages: list[dict], conv_id: str) -> str:
         continue_conversation=not handle.is_new,
         env={
             "CLAUDE_CONFIG_DIR": "/root/.clydecodebot/claude-auth",
+            "OPENCLAW_SESSION_ID": f"cc-{conv_id[:16]}",
+            "OPENCLAW_TURN_NUMBER": str(handle.sess["message_count"]),
         },
     )
 
@@ -248,8 +250,10 @@ async def run_claude_turn(messages: list[dict], conv_id: str) -> str:
     if not result:
         result = "(Claude Code completed the turn but produced no text output — likely performed tool actions only.)"
 
-    # Fire-and-forget: store the exchange in memory
+    # Fire-and-forget: store the exchange in memory + log outcome for ML labeling
+    turn_num = handle.sess["message_count"]
     asyncio.create_task(_ingest_turn(user_msg, result, conv_id))
+    asyncio.create_task(_log_outcome(f"cc-{conv_id[:16]}", turn_num, result))
 
     return result
 
@@ -308,6 +312,45 @@ def _extract_fact(user_msg: str, reply: str) -> str:
 
     fact = f"Q: {q} → A: {a}"
     return fact[:400]
+
+
+# ---------------------------------------------------------------------------
+# ML outcome logging — sends response text to daemon for labeling pipeline
+# ---------------------------------------------------------------------------
+DAEMON_SOCK = "/tmp/clyde-memo.sock"
+
+
+async def _log_outcome(session_id: str, turn_number: int, response_text: str):
+    """Fire-and-forget: send response to memo daemon for ML outcome labeling."""
+    try:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None, _sync_log_outcome, session_id, turn_number, response_text
+        )
+    except Exception as e:
+        LOG.debug(f"log_outcome failed: {e}")
+
+
+def _sync_log_outcome(session_id: str, turn_number: int, response_text: str):
+    """Blocking daemon socket call for log_outcome."""
+    import socket as sock_mod
+    try:
+        s = sock_mod.socket(sock_mod.AF_UNIX, sock_mod.SOCK_STREAM)
+        s.settimeout(10)
+        s.connect(DAEMON_SOCK)
+        payload = json.dumps({
+            "method": "log_outcome",
+            "params": {
+                "session_id": session_id,
+                "turn_number": turn_number,
+                "response_text": response_text[:10000],
+            }
+        })
+        s.sendall(payload.encode() + b"\n")
+        s.recv(4096)  # consume ack
+        s.close()
+    except Exception:
+        pass  # Non-fatal — don't break the bridge over ML logging
 
 
 # ---------------------------------------------------------------------------
