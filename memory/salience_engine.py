@@ -7,11 +7,12 @@ in topic_scorer.py with a richer salience model incorporating goal proximity,
 open question boost, narrative position, and working mode matching.
 
 Salience weights:
-    Semantic similarity: 0.35  (floor at 0.15)
+    Semantic similarity: 0.30  (floor at 0.15)
+    Graph walk:          0.10  (weighted BFS through entity graph)
     Recency:             0.15
     Goal proximity:      0.15
     Open question boost: 0.10
-    Narrative position:  0.10  (placeholder -- returns 0.5, Phase 3)
+    Narrative position:  0.05  (placeholder -- returns 0.5, Phase 3)
     Working mode:        0.10
     Frequency:           0.05
 
@@ -33,11 +34,12 @@ import db
 # Weights
 # ═══════════════════════════════════════════════════════════════════════════════
 
-W_SEMANTIC   = 0.35
+W_SEMANTIC   = 0.30
+W_GRAPH_WALK = 0.10
 W_RECENCY    = 0.15
 W_GOAL_PROX  = 0.15
 W_OQ_BOOST   = 0.10
-W_NARRATIVE   = 0.10
+W_NARRATIVE   = 0.05
 W_WORKING    = 0.10
 W_FREQUENCY  = 0.05
 
@@ -46,24 +48,28 @@ SEMANTIC_FLOOR = 0.15  # Minimum semantic contribution if score > 0
 # Named weight profiles for A/B testing
 WEIGHT_PROFILES = {
     "default": {
-        "semantic": 0.35, "recency": 0.15, "goal_prox": 0.15,
-        "oq_boost": 0.10, "narrative": 0.10, "working_mode": 0.10, "frequency": 0.05,
+        "semantic": 0.30, "graph_walk": 0.10, "recency": 0.15, "goal_prox": 0.15,
+        "oq_boost": 0.10, "narrative": 0.05, "working_mode": 0.10, "frequency": 0.05,
     },
     "semantic-heavy": {
-        "semantic": 0.50, "recency": 0.10, "goal_prox": 0.10,
+        "semantic": 0.45, "graph_walk": 0.05, "recency": 0.10, "goal_prox": 0.10,
         "oq_boost": 0.08, "narrative": 0.08, "working_mode": 0.08, "frequency": 0.06,
     },
     "recency-heavy": {
-        "semantic": 0.25, "recency": 0.30, "goal_prox": 0.10,
-        "oq_boost": 0.10, "narrative": 0.10, "working_mode": 0.10, "frequency": 0.05,
+        "semantic": 0.20, "graph_walk": 0.10, "recency": 0.30, "goal_prox": 0.10,
+        "oq_boost": 0.10, "narrative": 0.05, "working_mode": 0.10, "frequency": 0.05,
     },
     "goal-focused": {
-        "semantic": 0.25, "recency": 0.10, "goal_prox": 0.30,
-        "oq_boost": 0.15, "narrative": 0.10, "working_mode": 0.05, "frequency": 0.05,
+        "semantic": 0.20, "graph_walk": 0.10, "recency": 0.10, "goal_prox": 0.30,
+        "oq_boost": 0.15, "narrative": 0.05, "working_mode": 0.05, "frequency": 0.05,
+    },
+    "graph-heavy": {
+        "semantic": 0.20, "graph_walk": 0.25, "recency": 0.10, "goal_prox": 0.10,
+        "oq_boost": 0.10, "narrative": 0.05, "working_mode": 0.10, "frequency": 0.10,
     },
     "balanced": {
-        "semantic": 0.25, "recency": 0.15, "goal_prox": 0.15,
-        "oq_boost": 0.10, "narrative": 0.15, "working_mode": 0.15, "frequency": 0.05,
+        "semantic": 0.20, "graph_walk": 0.15, "recency": 0.15, "goal_prox": 0.15,
+        "oq_boost": 0.10, "narrative": 0.05, "working_mode": 0.15, "frequency": 0.05,
     },
 }
 
@@ -215,6 +221,27 @@ def get_working_mode_match(query, mem_text):
 # Entity boost (try to import, fallback gracefully)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _get_graph_walk_score(walked_entities: dict, mem_id: str) -> float:
+    """
+    Check if a memory's entities overlap with the graph walk results.
+    Returns 0.0-0.5 based on the max walk weight among matched entities.
+    """
+    if not walked_entities or not mem_id:
+        return 0.0
+    try:
+        from graph_walk import _get_memory_entity_ids, MAX_GRAPH_SCORE
+        entity_ids = _get_memory_entity_ids(mem_id)
+        if not entity_ids:
+            return 0.0
+        max_weight = 0.0
+        for eid in entity_ids:
+            if eid in walked_entities:
+                max_weight = max(max_weight, walked_entities[eid]["weight"])
+        return min(MAX_GRAPH_SCORE, max_weight)
+    except (ImportError, Exception):
+        return 0.0
+
+
 def _get_entity_boost(query, mem_id):
     """Get entity boost score, with graceful fallback."""
     try:
@@ -303,12 +330,23 @@ def salience_score(query, candidates, limit=5, weights=None):
         w = WEIGHT_PROFILES["default"]
 
     w_sem  = w["semantic"]
+    w_gw   = w.get("graph_walk", 0.10)
     w_rec  = w["recency"]
     w_goal = w["goal_prox"]
     w_oq   = w["oq_boost"]
     w_narr = w["narrative"]
     w_wm   = w["working_mode"]
     w_freq = w["frequency"]
+
+    # Pre-compute utility factors for all candidates (one batch query)
+    _utility_factors = {}
+    try:
+        from context_decay import get_utility_factors_batch
+        all_ids = [c.get("id", "") for c in candidates if c.get("id")]
+        if all_ids:
+            _utility_factors = get_utility_factors_batch(all_ids)
+    except (ImportError, Exception):
+        pass
 
     # Pre-compute query-level signals (once per query)
     try:
@@ -318,6 +356,20 @@ def salience_score(query, candidates, limit=5, weights=None):
         goal_prox = 0.0
 
     working_mode = get_working_mode(query)
+
+    # Pre-compute graph walk (once per query, shared across candidates)
+    _graph_walk_cache = {}
+    try:
+        from entity_boost import extract_entities_from_text
+        from graph_walk import weighted_bfs, expand_via_clusters
+        query_entities = list(extract_entities_from_text(query))
+        if query_entities:
+            walked = weighted_bfs(query_entities[:5], max_hops=2)
+            if walked:
+                walked = expand_via_clusters(walked)
+                _graph_walk_cache = walked
+    except (ImportError, Exception):
+        query_entities = []
 
     scored = []
     for c in candidates:
@@ -329,27 +381,37 @@ def salience_score(query, candidates, limit=5, weights=None):
         # 1. Semantic with floor
         semantic = max(SEMANTIC_FLOOR, raw_semantic) if raw_semantic > 0 else 0.0
 
-        # 2. Recency from keyscores
+        # 2. Graph walk score (per-candidate, uses pre-computed walk)
+        gw_score = 0.0
+        if _graph_walk_cache and mem_id:
+            gw_score = _get_graph_walk_score(_graph_walk_cache, mem_id)
+
+        # For graph-injected candidates, use their existing score as floor
+        if c.get("_source") == "graph_walk" and gw_score == 0.0:
+            gw_score = min(0.5, c.get("_walk_weight", c.get("score", 0.0)))
+
+        # 3. Recency from keyscores
         recency = get_recency_score(mem_id)
 
-        # 3. Goal proximity (query-level, same for all candidates)
+        # 4. Goal proximity (query-level, same for all candidates)
         gp = goal_prox
 
-        # 4. Open question boost (per-candidate)
+        # 5. Open question boost (per-candidate)
         oq = get_oq_boost(query, mem_text)
 
-        # 5. Narrative position (placeholder)
+        # 6. Narrative position (placeholder)
         narrative = get_narrative_position(query, mem_text)
 
-        # 6. Working mode match
+        # 7. Working mode match
         wm = get_working_mode_match(query, mem_text)
 
-        # 7. Frequency from keyscores
+        # 8. Frequency from keyscores
         frequency = get_frequency_score(mem_id)
 
         # Weighted sum
         final = (
             w_sem  * semantic +
+            w_gw   * gw_score +
             w_rec  * recency +
             w_goal * gp +
             w_oq   * oq +
@@ -362,6 +424,11 @@ def salience_score(query, candidates, limit=5, weights=None):
         entity_boost = _get_entity_boost(query, mem_id)
         final += entity_boost
 
+        # Utility factor: soft multiplier from context_decay loop
+        # Ranges 0.5 (heavily decayed) to 1.2 (consistently useful), neutral = 1.0
+        util_factor = _utility_factors.get(mem_id, 1.0) if _utility_factors else 1.0
+        final *= util_factor
+
         scored.append({
             "final": round(final, 4),
             "score": round(raw_semantic, 4),
@@ -370,6 +437,7 @@ def salience_score(query, candidates, limit=5, weights=None):
             "id": mem_id,
             "breakdown": {
                 "semantic": round(semantic, 4),
+                "graph_walk": round(gw_score, 4),
                 "recency": round(recency, 4),
                 "goal_prox": round(gp, 4),
                 "oq_boost": round(oq, 4),
@@ -377,6 +445,7 @@ def salience_score(query, candidates, limit=5, weights=None):
                 "working_mode": round(wm, 4),
                 "frequency": round(frequency, 4),
                 "entity_boost": round(entity_boost, 4),
+                "utility_factor": round(util_factor, 4),
             },
         })
 
@@ -464,20 +533,21 @@ if __name__ == "__main__":
         w = WEIGHT_PROFILES[profile_name]
         print(f"\n  {BOLD}[{profile_name}] \"{args.query}\"{RESET}")
         print(f"  {DIM}({len(results)} results in {elapsed_ms:.0f}ms){RESET}")
-        print(f"  {DIM}sem={w['semantic']}  rec={w['recency']}  goal={w['goal_prox']}  "
+        print(f"  {DIM}sem={w['semantic']}  gw={w.get('graph_walk', 0.10)}  rec={w['recency']}  goal={w['goal_prox']}  "
               f"oq={w['oq_boost']}  narr={w['narrative']}  wm={w['working_mode']}  "
               f"freq={w['frequency']}{RESET}\n")
 
-        print(f"  {'#':>2}  {'Final':>6}  {'Sem':>5}  {'Rec':>5}  {'Goal':>5}  "
+        print(f"  {'#':>2}  {'Final':>6}  {'Sem':>5}  {'GW':>5}  {'Rec':>5}  {'Goal':>5}  "
               f"{'OQ':>4}  {'Narr':>5}  {'WM':>4}  {'Freq':>5}  {'Ent':>4}  Memory")
-        print(f"  {'-' * 105}")
+        print(f"  {'-' * 115}")
 
         for i, r in enumerate(results, 1):
             bd = r["breakdown"]
-            mem_preview = r["memory"][:45]
+            mem_preview = r["memory"][:40]
             print(
                 f"  {i:2d}  {r['final']:.4f}  "
                 f"{bd['semantic']:.3f}  "
+                f"{bd.get('graph_walk', 0):.3f}  "
                 f"{bd['recency']:.3f}  "
                 f"{bd['goal_prox']:.3f}  "
                 f"{bd['oq_boost']:.2f}  "

@@ -281,11 +281,20 @@ def compute_labels(batch_size: int = 100) -> dict:
     Retroactively label unlabeled retrievals by matching them against
     the response text from the same session/turn.
 
+    Uses cursor-based queries (not pg_query) because memory_text and
+    response_text can contain pipe characters that break pipe-delimited parsing.
+
     Returns:
         dict with counts: labeled, skipped (no matching response), total_unlabeled
     """
+    conn = db.get_pg()
+    if conn is None:
+        return {"labeled": 0, "remaining_unlabeled": 0, "error": "no PG connection"}
+
+    cur = conn.cursor()
+
     # Find unlabeled retrievals that have a matching response
-    result = db.pg_query(
+    cur.execute(
         "SELECT r.id, r.memory_text, r.session_id, r.turn_number, "
         "resp.response_text, r.cosine_score "
         "FROM ml_retrievals r "
@@ -297,38 +306,35 @@ def compute_labels(batch_size: int = 100) -> dict:
         "LIMIT %s",
         (batch_size,)
     )
+    rows = cur.fetchall()
 
-    if not result:
+    if not rows:
         remaining = db.pg_query("SELECT count(*) FROM ml_retrievals WHERE label IS NULL")
         return {"labeled": 0, "remaining_unlabeled": int(remaining or 0), "batch_size": batch_size}
 
     labeled = 0
-    for line in result.split("\n"):
-        parts = line.split("|")
-        if len(parts) < 6:
-            continue
-
-        rid = parts[0]
-        mem_text = parts[1]
-        session_id = parts[2]
-        turn_number = int(parts[3]) if parts[3] else 0
-        response_text = parts[4]
-        cosine = float(parts[5]) if parts[5] else 0.0
+    for row in rows:
+        rid = row[0]
+        mem_text = row[1] or ""
+        session_id = row[2]
+        turn_number = row[3] or 0
+        response_text = row[4] or ""
+        cosine = float(row[5]) if row[5] is not None else 0.0
 
         if not mem_text or not response_text:
             continue
 
         # Check for correction in the NEXT turn's user message
-        # (responses table may store user follow-ups too, or we check retrievals)
-        next_resp = db.pg_query(
+        cur.execute(
             "SELECT response_text FROM ml_responses "
             "WHERE session_id = %s AND turn_number = %s",
             (session_id, turn_number + 1)
         )
+        next_row = cur.fetchone()
 
         correction_followed = False
-        if next_resp:
-            correction_followed = _is_correction(next_resp)
+        if next_row and next_row[0]:
+            correction_followed = _is_correction(next_row[0])
 
         # Compute overlap
         overlap = _word_overlap_score(mem_text, response_text)

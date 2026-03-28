@@ -419,6 +419,45 @@ def cmd_search(args):
     return 0
 
 
+def cmd_format(args):
+    """Search + format as structured context block for prompt injection."""
+    search_params = {
+        "query": args.query, "user_id": args.user, "limit": args.limit,
+        "skip_gate": True,  # Formatter does its own filtering
+    }
+    sid = os.environ.get("OPENCLAW_SESSION_ID")
+    turn = os.environ.get("OPENCLAW_TURN_NUMBER")
+    if sid:
+        search_params["session_id"] = sid
+    if turn:
+        try:
+            search_params["turn_number"] = int(turn)
+        except ValueError:
+            pass
+    dresp = _daemon_request("search", search_params)
+    if dresp is None or not dresp.get("ok"):
+        return 0
+
+    try:
+        from prompt_formatter import PackagedContext
+        pkg = PackagedContext.from_search_response(dresp, query=args.query)
+        block = pkg.to_prompt_block()
+        if block:
+            print(block)
+        # Log which bucket each memory was packaged into (for context_decay)
+        try:
+            from context_decay import log_packaged_buckets
+            log_packaged_buckets(dresp.get("results", []), pkg.classified)
+        except Exception:
+            pass  # non-fatal
+    except Exception as e:
+        # Fallback: just show flat results
+        boosted = dresp.get("results", [])
+        if boosted:
+            _display_boosted(boosted)
+    return 0
+
+
 def cmd_list(args):
     """List all memories for a user."""
     # Try daemon first
@@ -799,6 +838,12 @@ def main():
     p_pin.add_argument("memory_id", help="Memory ID (or prefix) to pin")
     p_pin.add_argument("--unpin", action="store_true", help="Unpin instead of pin")
 
+    # format — structured context block for prompt injection
+    p_format = sub.add_parser("format", help="Search + format as structured context block")
+    p_format.add_argument("query", help="Search query")
+    p_format.add_argument("--user", default=CLYDE_USER, help=f"User ID (default: {CLYDE_USER})")
+    p_format.add_argument("--limit", type=int, default=10, help="Max results to classify")
+
     # ingest
     p_ingest = sub.add_parser("ingest", help="Ingest a markdown file as memories")
     p_ingest.add_argument("file", help="Path to markdown file")
@@ -812,6 +857,7 @@ def main():
     cmds = {
         "add": cmd_add,
         "search": lambda a: cmd_search_debug(a) if getattr(a, "debug", False) else cmd_search(a),
+        "format": cmd_format,
         "list": cmd_list,
         "delete": cmd_delete,
         "reset": cmd_reset,
