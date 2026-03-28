@@ -3255,6 +3255,50 @@ async def _delete_after(bot, chat_id, message_id, delay=30):
         pass
 
 
+def _wrap_markdown_tables(text: str) -> str:
+    """Detect markdown tables in text and wrap them in code blocks for Telegram.
+
+    Telegram doesn't render markdown tables natively, so we convert them to
+    pre-formatted monospace blocks that preserve column alignment.
+    """
+    lines = text.split("\n")
+    result = []
+    in_table = False
+    table_lines = []
+
+    for line in lines:
+        stripped = line.strip()
+        # A table row starts with | and ends with |
+        is_table_row = stripped.startswith("|") and stripped.endswith("|")
+        # Separator rows like |---|---|
+        is_separator = is_table_row and all(
+            c in "-| :" for c in stripped
+        )
+
+        if is_table_row or is_separator:
+            if not in_table:
+                in_table = True
+                table_lines = []
+            table_lines.append(stripped)
+        else:
+            if in_table:
+                # Flush accumulated table as a code block
+                result.append("```")
+                result.extend(table_lines)
+                result.append("```")
+                table_lines = []
+                in_table = False
+            result.append(line)
+
+    # Flush any trailing table
+    if in_table and table_lines:
+        result.append("```")
+        result.extend(table_lines)
+        result.append("```")
+
+    return "\n".join(result)
+
+
 def chunk_message(text, max_length=4096):
     if len(text) <= max_length: return [text]
     chunks = []
@@ -4445,6 +4489,7 @@ async def handle_message(update, context):
         session_id = f"tg-{uid}"
         asyncio.create_task(_post_log_outcome(session_id, turn_number, response))
 
+        cleaned = _wrap_markdown_tables(cleaned)
         full = cleaned + "\n\n— Complete — (%.1fs)" % elapsed
         chunks = chunk_message(full, config.max_message_length)
         await _final_edit(chunks[0])
